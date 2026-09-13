@@ -149,6 +149,9 @@ private struct UIResponsivenessRegression {
             try await testPlaylistControls()
             try await testPlaylistTransitions()
             try await testWorkers()
+            try await testInteractiveUpdates()
+            try await testWallpaperSizes()
+            try await testSubscriptionFiltering()
             try await testConditions()
             try testObservation()
             try await testImages()
@@ -211,6 +214,189 @@ private struct UIResponsivenessRegression {
         }
     }
 
+    static func testInteractiveUpdates() async throws {
+        let throttler = LatestValueThrottler<String>()
+        var left: [Int] = []
+        var right: [Int] = []
+        for value in 0..<48 {
+            throttler.submit(key: "left") { left.append(value) }
+            throttler.submit(key: "right") { right.append(value * 2) }
+            try await Task.sleep(for: .milliseconds(4))
+        }
+        try require(left.count > 3 && right.count > 3, "Continuous input postponed all renderer updates until dragging stopped")
+        throttler.flush(key: "left")
+        throttler.flush(key: "right")
+        try require(left.last == 47 && right.last == 94, "Ending a drag lost its final value or mixed displays")
+        let count = left.count
+        throttler.submit(key: "left") { left.append(-1) }
+        throttler.cancel(key: "left")
+        try await Task.sleep(for: .milliseconds(40))
+        try require(left.count == count, "A cancelled interaction still sent a command")
+
+        let key = DisplayKey(rawValue: "interaction-a")
+        let otherKey = DisplayKey(rawValue: "interaction-b")
+        var first = try wallpaper("interaction-first")
+        first.project.general = WEProjectGeneral(properties: WEProjectProperties(items: [
+            "left": WEProjectProperty(type: "slider", value: .number(0)),
+            "right": WEProjectProperty(type: "slider", value: .number(10))
+        ]))
+        let state = DisplayWallpaperState(wallpaper: first, runtime: WallpaperRuntimeState())
+        let model = WallpaperViewModel(initialStates: [key: state, otherKey: state])
+        let rows = model.propertyModel.rows
+        let leftValue = rows.first { $0.id == "left" }!.state
+        let rightValue = rows.first { $0.id == "right" }!.state
+        let leftChanges = Locked(0)
+        let rightChanges = Locked(0)
+        let structureChanges = Locked(0)
+        let volumeChanges = Locked(0)
+        withObservationTracking { _ = leftValue.value } onChange: { leftChanges.access { $0 += 1 } }
+        withObservationTracking { _ = rightValue.value } onChange: { rightChanges.access { $0 += 1 } }
+        withObservationTracking { _ = model.propertyModel.rows } onChange: { structureChanges.access { $0 += 1 } }
+        withObservationTracking { _ = model.playVolume } onChange: { volumeChanges.access { $0 += 1 } }
+        var runtime = model.runtime
+        runtime.propertyOverrides["left"] = .number(5)
+        model.runtime = runtime
+        try require(leftChanges.access { $0 } == 1 && rightChanges.access { $0 } == 0 &&
+                    structureChanges.access { $0 } == 0 && volumeChanges.access { $0 } == 0,
+                    "Changing one property invalidated unrelated controls or the property list")
+        try require(model.state(for: otherKey)?.runtime.propertyOverrides.isEmpty == true,
+                    "A property update changed another display")
+        let second = try wallpaper("interaction-second")
+        let third = try wallpaper("interaction-third")
+        var prepared: [String] = []
+        model.prepareWallpaper(second, for: key) { prepared.append($0.id) }
+        try require(model.previewWallpaper.id == second.id && model.currentWallpaper.id == first.id && model.isApplyingSelection,
+                    "Selecting a wallpaper waited for the renderer or prematurely committed playback")
+        model.prepareWallpaper(third, for: key) { prepared.append($0.id) }
+        try await waitUntil("latest preview preparation") { prepared == [third.id] }
+        try require(model.previewWallpaper.id == third.id && model.currentWallpaper.id == first.id,
+                    "An obsolete preparation overwrote the current selection")
+        model.cancelPendingPreview(wallpaperID: third.id)
+        try require(model.previewWallpaper.id == first.id && !model.isApplyingSelection,
+                    "Cancelling a selection failed to restore the committed preview")
+        var invalidFinished = false
+        let invalid = WEWallpaper(using: .invalid, where: root.appending(path: "missing-selection"))
+        model.prepareWallpaper(invalid, for: key) { _ in invalidFinished = true }
+        try await waitUntil("invalid selection rollback") { invalidFinished }
+        try require(model.previewWallpaper.id == first.id && !model.isApplyingSelection,
+                    "An invalid selection left the preview in a loading state")
+        let unsupportedDirectory = root.appending(path: "unsupported-selection")
+        try FileManager.default.createDirectory(at: unsupportedDirectory, withIntermediateDirectories: true)
+        let unsupportedProject = WEProject(file: "app.exe", preview: "", title: "Unsupported", type: "application")
+        try JSONEncoder().encode(unsupportedProject).write(to: unsupportedDirectory.appending(path: "project.json"))
+        var unsupportedFinished = false
+        model.prepareWallpaper(WEWallpaper.load(from: unsupportedDirectory), for: key) { _ in unsupportedFinished = true }
+        try await waitUntil("unsupported selection rollback") { unsupportedFinished }
+        try require(model.previewWallpaper.id == first.id && !model.isApplyingSelection,
+                    "An unsupported wallpaper left the preview in a loading state")
+        model.prepareWallpaper(second, for: key) { _ in }
+        model.prepareWallpaper(second, for: otherKey) { _ in }
+        model.cancelPendingPreview(wallpaperID: second.id, for: otherKey)
+        try require(model.previewWallpaper.id == second.id && model.isApplyingSelection,
+                    "Cancelling another display cleared this display's selection")
+        model.cancelPendingPreview(wallpaperID: second.id, for: key)
+        print("PASS: continuous interaction delivery, final values, cancellation, per-property observation and immediate selection rollback")
+    }
+
+    static func testWallpaperSizes() async throws {
+        let calls = Locked(0)
+        let ranOnMain = Locked(false)
+        let cache = WallpaperSizeCache { _, cancelled in
+            calls.access { $0 += 1 }
+            if Thread.isMainThread { ranOnMain.access { $0 = true } }
+            for _ in 0..<60 {
+                if cancelled() { return nil }
+                usleep(1_000)
+            }
+            return 4_096
+        }
+        let directory = root.appending(path: "size-shared")
+        let cancelledDelivered = Locked(false)
+        let values = Locked([Int]())
+        let token = cache.load(at: directory) { _ in cancelledDelivered.access { $0 = true } }
+        cache.load(at: directory) { value in if let value { values.access { $0.append(value) } } }
+        cache.cancel(token)
+        let synchronous = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async { continuation.resume(returning: cache.size(at: directory)) }
+        }
+        try await waitUntil("shared size result") { values.access { $0 } == [4_096] }
+        try require(calls.access { $0 } == 1 && synchronous == 4_096 && !ranOnMain.access({ $0 }) &&
+                    !cancelledDelivered.access({ $0 }), "Directory size work was duplicated, blocked main, or ignored consumer cancellation")
+        try require(cache.size(at: directory) == 4_096 && calls.access { $0 } == 1, "Directory size cache was not reused")
+
+        let began = Locked(false)
+        let cancelled = Locked(false)
+        let cancellable = WallpaperSizeCache { _, isCancelled in
+            began.access { $0 = true }
+            while !isCancelled() { usleep(1_000) }
+            cancelled.access { $0 = true }
+            return nil
+        }
+        let cancelling = cancellable.load(at: directory) { _ in }
+        try await waitUntil("cancellable directory enumeration") { began.access { $0 } }
+        cancellable.cancel(cancelling)
+        try await waitUntil("cancelled directory enumeration") { cancelled.access { $0 } }
+
+        let oldStarted = Locked(false)
+        let gate = DispatchSemaphore(value: 0)
+        let generation = Locked(0)
+        let generations = WallpaperSizeCache { _, _ in
+            let current = generation.access { value in value += 1; return value }
+            if current == 1 { oldStarted.access { $0 = true }; gate.wait() }
+            return current
+        }
+        generations.load(at: directory) { _ in }
+        try await waitUntil("old size generation") { oldStarted.access { $0 } }
+        generations.invalidate()
+        let fresh = Locked<Int?>(nil)
+        generations.load(at: directory) { result in fresh.access { $0 = result } }
+        try await waitUntil("new size generation") { fresh.access { $0 } == 2 }
+        gate.signal()
+        try await Task.sleep(for: .milliseconds(30))
+        try require(generations.cachedSize(at: directory) == 2, "An obsolete enumeration replaced a newer cached size")
+
+        let displayCache = WallpaperSizeCache { url, _ in url.lastPathComponent == "one" ? 1 : 2 }
+        let display = WallpaperSizeModel(cache: displayCache)
+        display.load(root.appending(path: "one"))
+        display.load(root.appending(path: "two"))
+        try await waitUntil("current size label") { display.bytes == 2 }
+        try await Task.sleep(for: .milliseconds(30))
+        try require(display.bytes == 2, "An old size callback changed the current label")
+        print("PASS: shared directory work, background execution, cooperative cancellation, cache invalidation and stale label rejection")
+    }
+
+    static func testSubscriptionFiltering() async throws {
+        let items = (0..<600).map { index in
+            WorkshopItem(publishedFileId: String(index), title: index % 2 == 0 ? "Alpha" : "Beta",
+                itemDescription: "Subscription fixture", previewImageURL: nil, tags: [], subscriptions: 0,
+                favorited: 0, views: 0, fileSize: 1, timeCreated: Date(), timeUpdated: Date(),
+                creatorSteamId: "", wallpaperType: "video")
+        }
+        let model = WorkshopViewModel(subscriptionCatalog: items)
+        try await waitUntil("subscription catalog") { !model.isFilteringSubscriptions && model.subscriptionTotal == 600 }
+        model.subscriptionSearchText = " Alpha "
+        model.refreshSubscriptionFilters()
+        try await waitUntil("subscription search") { !model.isFilteringSubscriptions && model.subscriptionTotal == 300 }
+        try require(model.subscriptionItems.allSatisfy { $0.title == "Alpha" }, "Subscription filtering returned unmatched items")
+        model.goToSubscriptionPage(2)
+        try require(model.subscriptionCurrentPage == 2 && !model.isFilteringSubscriptions,
+                    "Paging reran subscription filtering")
+        model.subscriptionSearchText = "Beta"
+        model.refreshSubscriptionFilters()
+        try await Task.sleep(for: .milliseconds(1))
+        model.subscriptionSearchText = "Alpha"
+        model.refreshSubscriptionFilters()
+        try await waitUntil("restored cached filter") { !model.isFilteringSubscriptions }
+        try await Task.sleep(for: .milliseconds(80))
+        try require(model.subscriptionItems.allSatisfy { $0.title == "Alpha" } && model.subscriptionCurrentPage == 1,
+                    "A stale background filter overwrote the restored search")
+        model.subscriptionSearchText = "does-not-exist"
+        model.refreshSubscriptionFilters()
+        try await waitUntil("empty subscription filter") { !model.isFilteringSubscriptions && model.subscriptionTotal == 0 }
+        try require(model.subscriptionItems.isEmpty && model.subscriptionCurrentPage == 1, "Empty filtering left an invalid page")
+        print("PASS: background subscription filtering, cached pagination, rapid query reversal and empty-result clamping")
+    }
+
     static func testConditions() async throws {
         let evaluator = WEConditionEvaluator(evaluationTimeout: 0.15, startupTimeout: 1.5)
         defer { evaluator.cancel() }
@@ -220,6 +406,15 @@ private struct UIResponsivenessRegression {
         try require(basic["flag.value"] == true && basic["amount.value > 2"] == true &&
                     basic["false"] == false && basic["undefined"] == true && basic["missing.value"] == true,
                     "Condition semantics changed")
+        let typed: [String: Bool] = await withCheckedContinuation { continuation in
+            evaluator.evaluate(identity: "typed", conditions: ["flag.value === false", "amount.value === 7", "label.value === 'hello'"],
+                properties: ["flag": WEProjectProperty(type: "bool", value: .string("1")),
+                             "amount": WEProjectProperty(type: "slider", value: .string("2")),
+                             "label": WEProjectProperty(type: "textinput", value: .string("hello"))],
+                overrides: ["flag": .bool(false), "amount": .number(7)]) { continuation.resume(returning: $0) }
+        }
+        try require(typed.count == 3 && typed.values.allSatisfy { $0 },
+                    "Background condition preparation changed property types or override precedence")
         let ticks = Locked(0)
         let timer = Timer.scheduledTimer(withTimeInterval: 0.005, repeats: true) { _ in ticks.access { $0 += 1 } }
         let start = Date()

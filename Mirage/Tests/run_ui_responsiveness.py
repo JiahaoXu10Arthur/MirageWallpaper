@@ -18,6 +18,9 @@ def main():
                         default=Path(tempfile.gettempdir()) / "MirageUIRegressionBuild")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--startup-playlist", action="store_true")
+    parser.add_argument("--configuration", choices=["Debug", "Release"], default="Debug")
+    parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--baseline-api", action="store_true")
     args = parser.parse_args()
     project = Path(__file__).resolve().parents[1]
     artifacts = Path(tempfile.mkdtemp(prefix="mirage-ui-regression-"))
@@ -28,23 +31,39 @@ def main():
         with (artifacts / "build.log").open("w") as log:
             result = subprocess.run([
                 "xcodebuild", "-project", str(project / "Mirage Wallpaper.xcodeproj"),
-                "-scheme", "Mirage Wallpaper", "-configuration", "Debug",
+                "-scheme", "Mirage Wallpaper", "-configuration", args.configuration,
                 "-derivedDataPath", str(args.derived_data),
                 "-destination", f"platform=macOS,arch={platform.machine()}",
                 "-onlyUsePackageVersionsFromResolvedFile", "CODE_SIGNING_ALLOWED=NO",
-                "ONLY_ACTIVE_ARCH=YES", "build"
+                "ONLY_ACTIVE_ARCH=YES", "ENABLE_TESTABILITY=YES", "ENABLE_DEBUG_DYLIB=YES", "build"
             ], stdout=log, stderr=subprocess.STDOUT, env=env)
         if result.returncode:
             raise SystemExit(f"Build failed; see {artifacts / 'build.log'}")
-    products = args.derived_data / "Build/Products/Debug"
+    products = args.derived_data / "Build/Products" / args.configuration
     app = products / "Mirage Wallpaper.app/Contents"
-    executable = artifacts / "UIResponsivenessRegression"
+    library = app / "MacOS/Mirage Wallpaper.debug.dylib"
+    if not library.exists():
+        library = artifacts / "libMirageUITesting.dylib"
+        objects = (args.derived_data / "Build/Intermediates.noindex/Mirage Wallpaper.build" /
+                   args.configuration / "Mirage Wallpaper.build/Objects-normal" /
+                   platform.machine() / "Mirage Wallpaper.LinkFileList")
+        subprocess.run([
+            "xcrun", "swiftc", "-emit-library", "-profile-generate", "-target",
+            f"{platform.machine()}-apple-macos14.2", "-F", str(products),
+            "-F", str(products / "PackageFrameworks"),
+            *objects.read_text().splitlines(),
+            "-o", str(library)
+        ], check=True, env=env)
+    name = "UIInteractionBenchmark" if args.benchmark else "UIResponsivenessRegression"
+    executable = artifacts / name
     subprocess.run([
         "xcrun", "swiftc", "-parse-as-library", "-target",
         f"{platform.machine()}-apple-macos14.2", "-I", str(products),
         "-F", str(products), "-F", str(products / "PackageFrameworks"),
-        str(project / "Tests/UIResponsivenessRegression.swift"),
-        str(app / "MacOS/Mirage Wallpaper.debug.dylib"),
+        *( ["-O"] if args.configuration == "Release" else [] ),
+        *( ["-D", "MIRAGE_UI_BASELINE"] if args.baseline_api else [] ),
+        str(project / "Tests" / (name + ".swift")),
+        str(library),
         "-Xlinker", "-rpath", "-Xlinker", str(app / "MacOS"),
         "-Xlinker", "-rpath", "-Xlinker", str(app / "Frameworks"),
         "-o", str(executable)
