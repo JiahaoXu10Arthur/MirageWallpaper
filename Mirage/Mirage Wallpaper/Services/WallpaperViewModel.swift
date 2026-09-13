@@ -1729,7 +1729,7 @@ class WallpaperViewModel: PlaylistPlayback {
         guard !externalLockScreenSuspended else { return }
         guard let displayID = DisplayRegistry.shared.displayID(for: key) else { return }
         if action == .stop {
-            if stoppedByPlaybackPolicy.insert(key).inserted {
+            if stoppedByPlaybackPolicy.insert(key).inserted || force {
                 cancelFailedAssignmentRecovery(for: key)
                 commitPendingAssignmentForStoppedPolicy(for: key)
                 renderer.stop(displayID: displayID)

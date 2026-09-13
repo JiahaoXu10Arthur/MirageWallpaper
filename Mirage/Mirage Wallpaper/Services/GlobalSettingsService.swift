@@ -96,6 +96,17 @@ struct GlobalSettings: Codable, Equatable {
     var normalizedWindowCoverageThreshold: Double {
         min(100, max(1, windowCoverageThreshold ?? 90))
     }
+
+    var hasWindowPlaybackRules: Bool {
+        otherApplicationFocused != .keepRunning ||
+            otherApplicationFullscreen != .keepRunning ||
+            shouldPauseWhenWindowCoverageExceeds
+    }
+
+    var hasPlaybackRules: Bool {
+        hasWindowPlaybackRules || otherApplicationPlayingAudio != .keepRunning ||
+            displayAsleep != .keepRunning || laptopOnBattery != .keepRunning
+    }
     
     // MARK: Quality
     var antiAliasing = GSAntiAliasingQuality.msaa_x2
@@ -315,7 +326,9 @@ class GlobalSettingsViewModel {
         playbackPolicySettingsCancellable?.cancel()
         playbackEvalTimer?.invalidate()
         settlingEvalWorkItems.forEach { $0.cancel() }
-        for observer in workspacePlaybackObservers {
+        playbackRecoveryWorkItems.forEach { $0.cancel() }
+        if let powerSourceRunLoopSource { CFRunLoopSourceInvalidate(powerSourceRunLoopSource) }
+        for observer in workspacePlaybackObservers + playbackLifecycleObservers {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
         if let desktopClickMonitor { NSEvent.removeMonitor(desktopClickMonitor) }
@@ -360,12 +373,21 @@ class GlobalSettingsViewModel {
             .map { $0.shouldOverrideWallpaper }
             .sink { DesktopOverrideService.shared.didChangeEnabled($0) }
 
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(displayDidSleep),
-            name: NSWorkspace.screensDidSleepNotification, object: nil)
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(displayDidWake),
-            name: NSWorkspace.screensDidWakeNotification, object: nil)
+        let lifecycleNotifications: [(Notification.Name, PlaybackLifecycleEvent)] = [
+            (NSWorkspace.willSleepNotification, .systemSleep),
+            (NSWorkspace.didWakeNotification, .systemWake),
+            (NSWorkspace.screensDidSleepNotification, .displaySleep),
+            (NSWorkspace.screensDidWakeNotification, .displayWake)
+        ]
+        for (name, event) in lifecycleNotifications {
+            let observer = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { [weak self] _ in self?.handlePlaybackLifecycleEvent(event) }
+            playbackLifecycleObservers.append(observer)
+        }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(playbackDisplaysDidChange),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil)
 
         // Low Power Mode and thermal pressure are global signals: the user has
         // either asked the machine to conserve, or the machine is already
@@ -399,7 +421,10 @@ class GlobalSettingsViewModel {
 
     private var playbackEvalTimer: Timer?
     private var settlingEvalWorkItems: [DispatchWorkItem] = []
+    private var playbackRecoveryWorkItems: [DispatchWorkItem] = []
     private var workspacePlaybackObservers: [NSObjectProtocol] = []
+    private var playbackLifecycleObservers: [NSObjectProtocol] = []
+    private var powerSourceRunLoopSource: CFRunLoopSource?
     private var desktopClickMonitor: Any?
     // A click on bare desktop starts the reveal-desktop animation, during which
     // windows are still covering the screen and geometry detection would wrongly
@@ -415,11 +440,63 @@ class GlobalSettingsViewModel {
 
     /// Runs the window-geometry / power / audio probes off the main thread.
     private let policyQueue = DispatchQueue(label: "com.mirage.playback-policy", qos: .utility)
-    private var evaluationInFlight = false
-    private var evaluationPending = false
-    /// Bumped whenever the rule set is reconfigured, so results computed against
-    /// a stale rule set are discarded instead of applied.
-    private var policyGeneration: UInt64 = 0
+    private var playbackEvaluation = PlaybackEvaluationState()
+    private var lastPolicyReadFailure: PolicyReadFailure?
+
+    struct PlaybackEvaluationState {
+        struct Completion {
+            let shouldApply: Bool
+            let force: Bool
+            let shouldEvaluateAgain: Bool
+        }
+
+        private(set) var generation: UInt64 = 0
+        private(set) var isSleeping = false
+        private var inFlight = false
+        private var pending = false
+        private var forcePending = false
+
+        mutating func invalidate(force: Bool = false) {
+            generation &+= 1
+            pending = false
+            forcePending = forcePending || force
+        }
+
+        mutating func suspend() {
+            isSleeping = true
+            invalidate(force: true)
+        }
+
+        mutating func resume() {
+            isSleeping = false
+            invalidate(force: true)
+        }
+
+        mutating func begin() -> UInt64? {
+            guard !isSleeping else { return nil }
+            guard !inFlight else {
+                pending = true
+                return nil
+            }
+            inFlight = true
+            return generation
+        }
+
+        mutating func finish(generation: UInt64, hasResult: Bool) -> Completion {
+            inFlight = false
+            let shouldApply = hasResult && !isSleeping && generation == self.generation
+            let force = shouldApply && forcePending
+            if shouldApply { forcePending = false }
+            let shouldEvaluateAgain = pending && !isSleeping
+            pending = false
+            return Completion(shouldApply: shouldApply, force: force,
+                              shouldEvaluateAgain: shouldEvaluateAgain)
+        }
+    }
+
+    enum PlaybackLifecycleEvent: String {
+        case systemSleep, systemWake, displaySleep, displayWake, displaysChanged
+    }
 
     // Polling exists only as a backstop for transitions macOS does not announce
     // (desktop reveal, Mission Control, F11). Once the decision stops changing
@@ -436,9 +513,12 @@ class GlobalSettingsViewModel {
     private func schedulePlaybackTimer(interval: TimeInterval) {
         playbackEvalTimer?.invalidate()
         currentPollInterval = interval
-        playbackEvalTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) {
+        let timer = Timer(timeInterval: interval, repeats: true) {
             [weak self] _ in self?.evaluatePlaybackState()
         }
+        timer.tolerance = interval * 0.1
+        playbackEvalTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     private func backOffPollingInterval() {
@@ -454,15 +534,19 @@ class GlobalSettingsViewModel {
     }
 
     private func configurePlaybackMonitoring() {
-        // Invalidate any evaluation still in flight: it was computed against the
-        // previous rule set, and letting it land would overwrite the decision
-        // this reconfiguration is about to make.
-        policyGeneration &+= 1
-        evaluationPending = false
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.configurePlaybackMonitoring() }
+            return
+        }
+        playbackEvaluation.invalidate(force: true)
         playbackEvalTimer?.invalidate()
         playbackEvalTimer = nil
         settlingEvalWorkItems.forEach { $0.cancel() }
         settlingEvalWorkItems.removeAll()
+        playbackRecoveryWorkItems.forEach { $0.cancel() }
+        playbackRecoveryWorkItems.removeAll()
+        if let powerSourceRunLoopSource { CFRunLoopSourceInvalidate(powerSourceRunLoopSource) }
+        powerSourceRunLoopSource = nil
         for observer in workspacePlaybackObservers {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
@@ -472,22 +556,16 @@ class GlobalSettingsViewModel {
             self.desktopClickMonitor = nil
         }
 
-        let windowRulesEnabled = settings.otherApplicationFocused != .keepRunning ||
-            settings.otherApplicationFullscreen != .keepRunning ||
-            settings.shouldPauseWhenWindowCoverageExceeds
-        let anyRuleEnabled = windowRulesEnabled ||
-            settings.otherApplicationPlayingAudio != .keepRunning ||
-            settings.displayAsleep != .keepRunning ||
-            settings.laptopOnBattery != .keepRunning
-
-        guard anyRuleEnabled,
+        guard settings.hasPlaybackRules,
               AppDelegate.shared.wallpaperViewModel.hasAnyWallpaper else {
             effectivePlaybackActions.removeAll()
-            AppDelegate.shared.wallpaperViewModel.applyPlaybackPolicy(.keepRunning)
+            if !playbackEvaluation.isSleeping {
+                AppDelegate.shared.wallpaperViewModel.applyPlaybackPolicy(.keepRunning, force: true)
+            }
             return
         }
 
-        if windowRulesEnabled {
+        if settings.hasWindowPlaybackRules {
             let playbackNotifications: [Notification.Name] = [
                 NSWorkspace.activeSpaceDidChangeNotification,
                 NSWorkspace.didActivateApplicationNotification,
@@ -530,20 +608,88 @@ class GlobalSettingsViewModel {
         // Focus/fullscreen rules also poll: revealing the desktop (click-wallpaper,
         // F11, hot corners, Mission Control) and re-covering it emit no reliable
         // notification, so periodic geometry checks keep playback correct.
-        let pollingRuleEnabled = windowRulesEnabled ||
-            settings.otherApplicationPlayingAudio != .keepRunning ||
-            settings.laptopOnBattery != .keepRunning ||
-            settings.displayAsleep != .keepRunning
-        if pollingRuleEnabled {
-            basePollInterval = windowRulesEnabled ? 1.0 : 2.0
-            stableEvaluationCount = 0
-            schedulePlaybackTimer(interval: basePollInterval)
-        }
+        startPlaybackPolling()
+        configurePowerSourceMonitoring()
         evaluatePlaybackState()
     }
 
-    @objc private func displayDidSleep() { scheduleSettlingEvaluations() }
-    @objc private func displayDidWake()  { scheduleSettlingEvaluations() }
+    private func startPlaybackPolling() {
+        guard !playbackEvaluation.isSleeping, settings.hasPlaybackRules,
+              AppDelegate.shared.wallpaperViewModel.hasAnyWallpaper else { return }
+        basePollInterval = settings.hasWindowPlaybackRules ? 1.0 : 2.0
+        stableEvaluationCount = 0
+        schedulePlaybackTimer(interval: basePollInterval)
+    }
+
+    private func configurePowerSourceMonitoring() {
+        guard powerSourceRunLoopSource == nil, settings.laptopOnBattery != .keepRunning,
+              AppDelegate.shared.wallpaperViewModel.hasAnyWallpaper else { return }
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        guard let source = IOPSNotificationCreateRunLoopSource({ context in
+            guard let context else { return }
+            Unmanaged<GlobalSettingsViewModel>.fromOpaque(context)
+                .takeUnretainedValue().powerSourceDidChange()
+        }, context)?.takeRetainedValue() else {
+            MirageLogService.shared.append("powerSource monitor unavailable", source: "playback-policy")
+            return
+        }
+        powerSourceRunLoopSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+    }
+
+    private func powerSourceDidChange() {
+        playbackEvaluation.invalidate()
+        stableEvaluationCount = 0
+        restorePollingInterval()
+        scheduleSettlingEvaluations()
+    }
+
+    @objc private func playbackDisplaysDidChange() {
+        handlePlaybackLifecycleEvent(.displaysChanged)
+    }
+
+    func handlePlaybackLifecycleEvent(_ event: PlaybackLifecycleEvent) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.handlePlaybackLifecycleEvent(event) }
+            return
+        }
+        settlingEvalWorkItems.forEach { $0.cancel() }
+        settlingEvalWorkItems.removeAll()
+        playbackRecoveryWorkItems.forEach { $0.cancel() }
+        playbackRecoveryWorkItems.removeAll()
+        lastDesktopRevealHintAt.removeAll()
+        switch event {
+        case .systemSleep:
+            playbackEvaluation.suspend()
+        case .systemWake, .displayWake:
+            playbackEvaluation.resume()
+            DisplayRegistry.shared.invalidate()
+        case .displaySleep:
+            playbackEvaluation.invalidate(force: true)
+        case .displaysChanged:
+            playbackEvaluation.invalidate(force: true)
+            DisplayRegistry.shared.invalidate()
+        }
+        playbackEvalTimer?.invalidate()
+        playbackEvalTimer = nil
+        MirageLogService.shared.append(
+            "event=\(event.rawValue) generation=\(playbackEvaluation.generation)",
+            source: "playback-policy")
+        guard !playbackEvaluation.isSleeping else { return }
+        startPlaybackPolling()
+        configurePowerSourceMonitoring()
+        evaluatePlaybackState()
+        let generation = playbackEvaluation.generation
+        for delay in [0.7, 2.0] {
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.playbackEvaluation.generation == generation else { return }
+                DisplayRegistry.shared.invalidate()
+                self.evaluatePlaybackState()
+            }
+            playbackRecoveryWorkItems.append(work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        }
+    }
 
     // Thermal and low-power transitions change the frame budget, not the
     // playback decision, so they skip the full evaluation and just re-apply.
@@ -592,10 +738,15 @@ class GlobalSettingsViewModel {
     // two intermediate samples the burst used to take only ever observed
     // mid-animation geometry that the final sample then overwrote.
     private func scheduleSettlingEvaluations() {
+        guard !playbackEvaluation.isSleeping else { return }
         settlingEvalWorkItems.forEach { $0.cancel() }
         settlingEvalWorkItems.removeAll()
+        let generation = playbackEvaluation.generation
         for delay in [0.05, 0.7] {
-            let work = DispatchWorkItem { [weak self] in self?.evaluatePlaybackState() }
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.playbackEvaluation.generation == generation else { return }
+                self.evaluatePlaybackState()
+            }
             settlingEvalWorkItems.append(work)
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
         }
@@ -841,7 +992,7 @@ class GlobalSettingsViewModel {
     /// Everything the policy decision needs, sampled from AppKit on the main
     /// thread. Kept to plain values so the expensive part of the evaluation can
     /// run on `policyQueue` without touching main-thread-only state.
-    private struct PolicyInputs {
+    struct PolicyInputs {
         var onDisplayAsleep = GSPlayback.keepRunning
         var onBattery = GSPlayback.keepRunning
         var onFocused = GSPlayback.keepRunning
@@ -876,11 +1027,27 @@ class GlobalSettingsViewModel {
 
     /// One parsed entry of the on-screen window list. The raw CFDictionary form
     /// is bridged once per evaluation and then reused by every geometry test.
-    private struct WindowEntry {
+    struct WindowEntry {
         var layer: Int
         var pid: pid_t
         var bounds: CGRect
         var alpha: Double
+    }
+
+    struct PolicyProbes {
+        var onBattery: () -> Bool? = GlobalSettingsViewModel.isOnBattery
+        var otherAppPlayingAudio: (pid_t, Set<pid_t>) -> Bool = GlobalSettingsViewModel.isOtherAppPlayingAudio
+        var displayAsleep: (CGDirectDisplayID) -> Bool = { CGDisplayIsAsleep($0) != 0 }
+        var windows: () -> [WindowEntry]? = GlobalSettingsViewModel.captureWindowList
+    }
+
+    struct PolicyResult {
+        let actions: [CGDirectDisplayID: GSPlayback]
+        let onBattery: Bool?
+    }
+
+    enum PolicyReadFailure: String, Error {
+        case displaysUnavailable, powerSourceUnavailable, windowListUnavailable
     }
 
     // Playback evaluation used to run entirely on the main thread, once a second,
@@ -894,29 +1061,40 @@ class GlobalSettingsViewModel {
             DispatchQueue.main.async { [weak self] in self?.evaluatePlaybackState() }
             return
         }
-        if evaluationInFlight {
-            evaluationPending = true
-            return
-        }
-        let inputs = collectPolicyInputs()
-        let generation = policyGeneration
-        evaluationInFlight = true
+        let wallpaperViewModel = AppDelegate.shared.wallpaperViewModel
+        guard wallpaperViewModel.hasAnyWallpaper,
+              let generation = playbackEvaluation.begin() else { return }
+        let inputs = collectPolicyInputs(for: wallpaperViewModel)
+        let started = ProcessInfo.processInfo.systemUptime
         policyQueue.async { [weak self] in
-            let actions = Self.computePlaybackActions(inputs)
+            let result = Self.computePlaybackActions(inputs)
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.evaluationInFlight = false
-                if self.policyGeneration == generation { self.applyPolicyResult(actions) }
-                if self.evaluationPending {
-                    self.evaluationPending = false
-                    self.evaluatePlaybackState()
+                let hasResult: Bool
+                switch result {
+                case .success: hasResult = true
+                case .failure: hasResult = false
                 }
+                let completion = self.playbackEvaluation.finish(
+                    generation: generation, hasResult: hasResult)
+                if completion.shouldApply, case .success(let value) = result {
+                    self.lastPolicyReadFailure = nil
+                    self.applyPolicyResult(value, force: completion.force,
+                                           elapsed: ProcessInfo.processInfo.systemUptime - started)
+                } else if generation == self.playbackEvaluation.generation,
+                          case .failure(let failure) = result,
+                          failure != self.lastPolicyReadFailure {
+                    self.lastPolicyReadFailure = failure
+                    MirageLogService.shared.append(
+                        "generation=\(generation) deferred=\(failure.rawValue)", source: "playback-policy")
+                }
+                if completion.shouldEvaluateAgain { self.evaluatePlaybackState() }
             }
         }
     }
 
     /// Main-thread half: read AppKit state into plain values. Cheap by design.
-    private func collectPolicyInputs() -> PolicyInputs {
+    func collectPolicyInputs(for wallpaperViewModel: WallpaperViewModel) -> PolicyInputs {
         var inputs = PolicyInputs()
         inputs.onDisplayAsleep = settings.displayAsleep
         inputs.onBattery = settings.laptopOnBattery
@@ -928,21 +1106,17 @@ class GlobalSettingsViewModel {
 
         inputs.selfPID = ProcessInfo.processInfo.processIdentifier
 
-        let needsWindowGeometry = settings.otherApplicationFocused != .keepRunning ||
-            settings.otherApplicationFullscreen != .keepRunning ||
-            settings.shouldPauseWhenWindowCoverageExceeds
+        let needsWindowGeometry = settings.hasWindowPlaybackRules
+        for info in DisplayRegistry.shared.connected where wallpaperViewModel.displayStates[info.key] != nil {
+            inputs.wallpaperDisplays[info.displayID] = needsWindowGeometry ? CGDisplayBounds(info.displayID) : .zero
+        }
         let needsRendererPIDs = needsWindowGeometry ||
             settings.otherApplicationPlayingAudio != .keepRunning
         if needsRendererPIDs {
-            inputs.rendererPIDs = AppDelegate.shared.wallpaperViewModel.renderer.processIdentifiers
+            inputs.rendererPIDs = wallpaperViewModel.renderer.processIdentifiers
         }
         guard needsWindowGeometry else { return inputs }
 
-        let registry = DisplayRegistry.shared
-        for key in AppDelegate.shared.wallpaperViewModel.displayStates.keys {
-            guard let displayID = registry.displayID(for: key) else { continue }
-            inputs.wallpaperDisplays[displayID] = CGDisplayBounds(displayID)
-        }
         let now = Date()
         lastDesktopRevealHintAt = lastDesktopRevealHintAt.filter {
             now.timeIntervalSince($0.value) < Self.desktopRevealGrace
@@ -961,20 +1135,33 @@ class GlobalSettingsViewModel {
 
     /// Background half: window geometry, power source and audio probes. Static so
     /// it provably touches no main-thread-owned state.
-    private static func computePlaybackActions(
-        _ inputs: PolicyInputs
-    ) -> [CGDirectDisplayID: GSPlayback] {
+    static func computePlaybackActions(
+        _ inputs: PolicyInputs, probes: PolicyProbes = PolicyProbes()
+    ) -> Result<PolicyResult, PolicyReadFailure> {
+        guard !inputs.wallpaperDisplays.isEmpty else { return .failure(.displaysUnavailable) }
         var globalActions: [GSPlayback] = []
-        if inputs.onBattery != .keepRunning, isOnBattery() {
-            globalActions.append(inputs.onBattery)
+        var onBattery: Bool?
+        if inputs.onBattery != .keepRunning {
+            guard let sampled = probes.onBattery() else { return .failure(.powerSourceUnavailable) }
+            onBattery = sampled
+            if sampled { globalActions.append(inputs.onBattery) }
         }
         if inputs.onAudio != .keepRunning,
-           isOtherAppPlayingAudio(selfPID: inputs.selfPID, rendererPIDs: inputs.rendererPIDs) {
+           probes.otherAppPlayingAudio(inputs.selfPID, inputs.rendererPIDs) {
             globalActions.append(inputs.onAudio)
         }
         let needsWindows = inputs.onFocused != .keepRunning ||
             inputs.onFullscreen != .keepRunning || inputs.pauseOnCoverage
-        let windows = needsWindows ? captureWindowList() : []
+        let windows: [WindowEntry]
+        if needsWindows {
+            guard inputs.wallpaperDisplays.values.allSatisfy({ $0.width > 0 && $0.height > 0 }) else {
+                return .failure(.displaysUnavailable)
+            }
+            guard let sampled = probes.windows() else { return .failure(.windowListUnavailable) }
+            windows = sampled
+        } else {
+            windows = []
+        }
         let isSelf = inputs.frontPID == inputs.selfPID
         let isDesktopFinder = inputs.frontBundleID == "com.apple.finder" &&
             !appHasVisibleWindows(windows, pid: inputs.frontPID)
@@ -982,7 +1169,7 @@ class GlobalSettingsViewModel {
         for (displayID, bounds) in inputs.wallpaperDisplays {
             var actions = globalActions
             if inputs.onDisplayAsleep != .keepRunning,
-               CGDisplayIsAsleep(displayID) != 0 {
+               probes.displayAsleep(displayID) {
                 actions.append(inputs.onDisplayAsleep)
             }
             if inputs.pauseOnCoverage,
@@ -1005,16 +1192,17 @@ class GlobalSettingsViewModel {
             }
             result[displayID] = strongestAction(actions)
         }
-        return result
+        return .success(PolicyResult(actions: result, onBattery: onBattery))
     }
 
     /// Main-thread tail: publish the decision and retune the polling cadence.
-    private func applyPolicyResult(_ actionsByDisplay: [CGDirectDisplayID: GSPlayback]) {
+    private func applyPolicyResult(_ result: PolicyResult, force: Bool, elapsed: TimeInterval) {
         let registry = DisplayRegistry.shared
-        let actions = Dictionary(uniqueKeysWithValues: actionsByDisplay.compactMap { displayID, action in
-            registry.key(forDisplay: displayID).map { ($0, action) }
+        let actions = Dictionary(uniqueKeysWithValues: result.actions.compactMap { displayID, action in
+            registry.info(forDisplay: displayID).map { ($0.key, action) }
         })
-        if actions == effectivePlaybackActions {
+        let changed = actions != effectivePlaybackActions
+        if !changed && !force {
             stableEvaluationCount += 1
             if stableEvaluationCount >= Self.stableEvaluationsBeforeBackoff {
                 stableEvaluationCount = 0
@@ -1025,14 +1213,22 @@ class GlobalSettingsViewModel {
             restorePollingInterval()
         }
         effectivePlaybackActions = actions
-        AppDelegate.shared.wallpaperViewModel.applyPlaybackPolicies(actions)
+        AppDelegate.shared.wallpaperViewModel.applyPlaybackPolicies(actions, force: force)
+        if changed || force {
+            let decisions = result.actions.sorted { $0.key < $1.key }
+                .map { "\($0.key):\($0.value.rawValue)" }.joined(separator: ",")
+            let battery = result.onBattery.map { String($0) } ?? "unused"
+            MirageLogService.shared.append(
+                "generation=\(playbackEvaluation.generation) battery=\(battery) actions=[\(decisions)] force=\(force) elapsedMs=\(Int(elapsed * 1000))",
+                source: "playback-policy")
+        }
     }
 
     /// Bridge the on-screen window list once. Front-to-back order is preserved,
     /// which `clickLandedOnDesktop` relies on.
-    private static func captureWindowList() -> [WindowEntry] {
+    private static func captureWindowList() -> [WindowEntry]? {
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-        let raw = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] ?? []
+        guard let raw = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return nil }
         return raw.compactMap { info in
             guard let layer = info[kCGWindowLayer as String] as? Int,
                   let pid = info[kCGWindowOwnerPID as String] as? pid_t,
@@ -1051,15 +1247,14 @@ class GlobalSettingsViewModel {
         return actions.max(by: { rank($0) < rank($1) }) ?? .keepRunning
     }
 
-    private static func isOnBattery() -> Bool {
+    private static func isOnBattery() -> Bool? {
         guard let blob = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
-              let list = IOPSCopyPowerSourcesList(blob)?.takeRetainedValue() as? [CFTypeRef] else { return false }
-        for ps in list {
-            guard let desc = IOPSGetPowerSourceDescription(blob, ps)?.takeUnretainedValue() as? [String: Any],
-                  let state = desc[kIOPSPowerSourceStateKey] as? String else { continue }
-            if state == kIOPSBatteryPowerValue { return true }
+              let source = IOPSGetProvidingPowerSourceType(blob)?.takeUnretainedValue() as String? else { return nil }
+        switch source {
+        case kIOPMBatteryPowerKey: return true
+        case kIOPMACPowerKey, kIOPMUPSPowerKey: return false
+        default: return nil
         }
-        return false
     }
 
     private static func isOtherAppPlayingAudio(selfPID: pid_t,
@@ -1224,7 +1419,7 @@ class GlobalSettingsViewModel {
             CGDisplayBounds($0.displayID).contains(cgPoint)
         })?.displayID else { return nil }
 
-        let windows = Self.captureWindowList()
+        guard let windows = Self.captureWindowList() else { return nil }
         let rendererPIDs = AppDelegate.shared.wallpaperViewModel.renderer.processIdentifiers
         let selfPID = ProcessInfo.processInfo.processIdentifier
 
