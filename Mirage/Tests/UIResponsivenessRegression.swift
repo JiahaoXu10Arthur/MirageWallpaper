@@ -134,6 +134,13 @@ private struct UIResponsivenessRegression {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             NSApplication.shared.setActivationPolicy(.accessory)
             NSApplication.shared.finishLaunching()
+            if CommandLine.arguments.contains("--playback-policy") {
+                try testPlaybackPolicyEvaluation()
+                try testPlaybackPolicyInputs()
+                try await testPlaybackPolicySynchronization()
+                print("PlaybackPolicyRegression: all checks passed")
+                return
+            }
             if let index = CommandLine.arguments.firstIndex(of: "--lock-preview-fixtures"), index + 1 < CommandLine.arguments.count {
                 try await testRealLockPreviews(in: URL(fileURLWithPath: CommandLine.arguments[index + 1], isDirectory: true))
                 return
@@ -159,10 +166,230 @@ private struct UIResponsivenessRegression {
             try await testLockScreenDeployment()
             try await testRenderers()
             try await testLogs()
+            try testPlaybackPolicyEvaluation()
+            try testPlaybackPolicyInputs()
+            try await testPlaybackPolicySynchronization()
             print("UIResponsivenessRegression: all checks passed")
         } catch {
             fputs("UIResponsivenessRegression: \(error)\n", stderr)
             exit(1)
+        }
+    }
+
+    static func testPlaybackPolicyEvaluation() throws {
+        var state = GlobalSettingsViewModel.PlaybackEvaluationState()
+        let beforeWake = state.begin()!
+        state.resume()
+        for _ in 0..<100 {
+            try require(state.begin() == nil, "Wake notifications started overlapping evaluations")
+        }
+        let stale = state.finish(generation: beforeWake, hasResult: true)
+        try require(!stale.shouldApply && !stale.force && stale.shouldEvaluateAgain,
+                    "A pre-wake result was applied or the new evaluation was lost")
+        let unavailable = state.finish(generation: state.begin()!, hasResult: false)
+        try require(!unavailable.shouldApply, "An unavailable power sample was applied")
+        let recovered = state.finish(generation: state.begin()!, hasResult: true)
+        try require(recovered.shouldApply && recovered.force,
+                    "A failed sample consumed the required wake synchronization")
+        let ordinary = state.finish(generation: state.begin()!, hasResult: true)
+        try require(ordinary.shouldApply && !ordinary.force, "Normal polling kept forcing playback commands")
+
+        let beforeSleep = state.begin()!
+        state.suspend()
+        state.invalidate(force: true)
+        try require(state.begin() == nil, "An evaluation started while the system was asleep")
+        let asleep = state.finish(generation: beforeSleep, hasResult: true)
+        try require(!asleep.shouldApply && !asleep.shouldEvaluateAgain, "Sleep allowed stale playback commands")
+        state.resume()
+        let firstWake = state.begin()!
+        state.resume()
+        state.invalidate()
+        try require(state.begin() == nil, "An overlapping power change bypassed evaluation coalescing")
+        let superseded = state.finish(generation: firstWake, hasResult: true)
+        try require(!superseded.shouldApply && superseded.shouldEvaluateAgain,
+                    "A second wake or power change accepted an obsolete result")
+        let final = state.finish(generation: state.begin()!, hasResult: true)
+        try require(final.shouldApply && final.force,
+                    "Repeated wake and power notifications lost the forced synchronization")
+        print("PASS: sleep boundaries, stale results, coalesced wake events and synchronization after unavailable samples")
+    }
+
+    static func testPlaybackPolicyInputs() throws {
+        guard let display = DisplayRegistry.shared.connected.first else {
+            throw RegressionFailure(description: "A connected display is required for playback policy regression")
+        }
+        let wallpaper = try wallpaper("playback-policy-inputs")
+        let model = WallpaperViewModel(initialStates: [
+            display.key: DisplayWallpaperState(wallpaper: wallpaper, runtime: WallpaperRuntimeState())
+        ])
+        let settingsModel = AppDelegate.shared.globalSettingsViewModel
+        let saved = settingsModel.settings
+        defer { settingsModel.settings = saved }
+        var windowQueries = 0
+        var probes = GlobalSettingsViewModel.PolicyProbes(
+            onBattery: { true }, otherAppPlayingAudio: { _, _ in true }, displayAsleep: { _ in true },
+            windows: { windowQueries += 1; return [] })
+        for rule in 0..<3 {
+            var settings = GlobalSettings()
+            let expected: GSPlayback
+            switch rule {
+            case 0: settings.laptopOnBattery = .pause; expected = .pause
+            case 1: settings.displayAsleep = .stop; expected = .stop
+            default: settings.otherApplicationPlayingAudio = .mute; expected = .mute
+            }
+            settingsModel.settings = settings
+            let inputs = settingsModel.collectPolicyInputs(for: model)
+            try require(inputs.wallpaperDisplays[display.displayID] != nil,
+                        "An independent battery, sleep or audio rule lost its display")
+            let result = try GlobalSettingsViewModel.computePlaybackActions(inputs, probes: probes).get()
+            try require(result.actions[display.displayID] == expected, "An independent playback rule was ignored")
+        }
+        try require(windowQueries == 0, "Global playback rules unnecessarily queried window geometry")
+
+        var inputs = GlobalSettingsViewModel.PolicyInputs()
+        inputs.wallpaperDisplays = [1001: CGRect(x: 0, y: 0, width: 1920, height: 1080),
+                                    1002: CGRect(x: 1920, y: 0, width: 1920, height: 1080)]
+        inputs.onBattery = .pause
+        inputs.onAudio = .mute
+        inputs.onDisplayAsleep = .stop
+        probes.displayAsleep = { $0 == 1001 }
+        let battery = try GlobalSettingsViewModel.computePlaybackActions(inputs, probes: probes).get()
+        try require(battery.actions == [1001: .stop, 1002: .pause], "Rule priority or per-display sleep was lost")
+        probes.onBattery = { false }
+        let ac = try GlobalSettingsViewModel.computePlaybackActions(inputs, probes: probes).get()
+        try require(ac.actions == [1001: .stop, 1002: .mute], "AC power incorrectly released another active rule")
+        probes.onBattery = { nil }
+        guard case .failure(.powerSourceUnavailable) = GlobalSettingsViewModel.computePlaybackActions(inputs, probes: probes) else {
+            throw RegressionFailure(description: "A failed power read was treated as AC power")
+        }
+        probes.onBattery = { true }
+        let retried = try GlobalSettingsViewModel.computePlaybackActions(inputs, probes: probes).get()
+        try require(retried.actions == battery.actions, "A recovered power sample did not restore battery policy")
+
+        inputs.onBattery = .keepRunning
+        inputs.onAudio = .keepRunning
+        inputs.onDisplayAsleep = .keepRunning
+        inputs.onFocused = .pause
+        probes.windows = { nil }
+        guard case .failure(.windowListUnavailable) = GlobalSettingsViewModel.computePlaybackActions(inputs, probes: probes) else {
+            throw RegressionFailure(description: "A failed window query was treated as an exposed desktop")
+        }
+        probes.windows = { [] }
+        let emptyWindows = try GlobalSettingsViewModel.computePlaybackActions(inputs, probes: probes).get()
+        try require(emptyWindows.actions == [1001: .keepRunning, 1002: .keepRunning],
+                    "A valid empty window list was rejected")
+        inputs.wallpaperDisplays.removeAll()
+        guard case .failure(.displaysUnavailable) = GlobalSettingsViewModel.computePlaybackActions(inputs, probes: probes) else {
+            throw RegressionFailure(description: "An unavailable display topology released playback rules")
+        }
+        print("PASS: independent battery, display sleep and audio rules, per-display priorities and failed system queries")
+    }
+
+    static func testPlaybackPolicySynchronization() async throws {
+        guard let display = DisplayRegistry.shared.connected.first else {
+            throw RegressionFailure(description: "A connected display is required for playback synchronization regression")
+        }
+        let directory = Bundle.main.resourceURL!.appending(path: "Renderers")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var createdBinaries: [URL] = []
+        for name in ["VideoWallpaper", "SceneWallpaper", "WebWallpaper"] {
+            let binary = directory.appending(path: name)
+            if !FileManager.default.fileExists(atPath: binary.path) {
+                try FileManager.default.createSymbolicLink(at: binary, withDestinationURL: Bundle.main.executableURL!)
+                createdBinaries.append(binary)
+            }
+        }
+        let commandLog = root.appending(path: "playback-policy-commands.jsonl")
+        try Data().write(to: commandLog)
+        let environmentKey = "MIRAGE_PLAYBACK_POLICY_COMMAND_LOG"
+        let previousEnvironment = ProcessInfo.processInfo.environment[environmentKey]
+        setenv(environmentKey, commandLog.path, 1)
+        let delegate = AppDelegate.shared
+        let settingsModel = delegate.globalSettingsViewModel
+        let savedSettings = settingsModel.settings
+        let savedModel = delegate.wallpaperViewModel
+        var settings = GlobalSettings()
+        settings.enableSpectrum = false
+        settingsModel.settings = settings
+        defer {
+            settingsModel.handlePlaybackLifecycleEvent(.systemSleep)
+            delegate.wallpaperViewModel = savedModel
+            settingsModel.settings = savedSettings
+            settingsModel.handlePlaybackLifecycleEvent(.systemWake)
+            if let previousEnvironment { setenv(environmentKey, previousEnvironment, 1) }
+            else { unsetenv(environmentKey) }
+            for binary in createdBinaries { try? FileManager.default.removeItem(at: binary) }
+        }
+        func commands(pid: pid_t) -> [[String: Any]] {
+            let text = (try? String(contentsOf: commandLog, encoding: .utf8)) ?? ""
+            return text.split(separator: "\n").compactMap { line in
+                guard let value = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      (value["pid"] as? NSNumber)?.int32Value == pid else { return nil }
+                return value
+            }
+        }
+        for (kind, file) in [("video", "video.mp4"), ("scene", "scene.json"), ("web", "index.html")] {
+            let fixture = root.appending(path: "playback-policy-\(kind)")
+            try FileManager.default.createDirectory(at: fixture, withIntermediateDirectories: true)
+            try JSONSerialization.data(withJSONObject: ["title": kind, "type": kind, "file": file])
+                .write(to: fixture.appending(path: "project.json"))
+            try Data("{}".utf8).write(to: fixture.appending(path: file))
+            let wallpaper = WEWallpaper.load(from: fixture)
+            let model = WallpaperViewModel(initialStates: [
+                display.key: DisplayWallpaperState(wallpaper: wallpaper, runtime: WallpaperRuntimeState())
+            ])
+            model.renderer.isWallpaperTrusted = { _ in true }
+            delegate.wallpaperViewModel = model
+            defer { model.renderer.stopAllAndWait() }
+            model.restoreAllDisplays()
+            try await waitUntil("\(kind) playback renderer") { model.renderer.isRendering(onDisplay: display.displayID) }
+            guard let pid = model.renderer.processIdentifiers.first else {
+                throw RegressionFailure(description: "Playback renderer has no process identifier")
+            }
+            let commandName = kind == "web" ? "playbackState" : "power"
+            func playbackCommands() -> [[String: Any]] {
+                commands(pid: pid).filter { $0["cmd"] as? String == commandName }
+            }
+            try await waitUntil("\(kind) initial playback directive") { !playbackCommands().isEmpty }
+            model.renderer.setFps(119, on: display.index)
+            try await waitUntil("\(kind) command barrier") {
+                commands(pid: pid).contains { $0["cmd"] as? String == "fps" && $0["value"] as? Int == 119 }
+            }
+            let beforeWake = playbackCommands().count
+            settingsModel.handlePlaybackLifecycleEvent(.systemSleep)
+            settingsModel.handlePlaybackLifecycleEvent(.systemWake)
+            settingsModel.handlePlaybackLifecycleEvent(.displayWake)
+            try await waitUntil("\(kind) unchanged state synchronized after wake") {
+                playbackCommands().count > beforeWake && playbackCommands().last?["state"] as? String == "run"
+            }
+            try require(commands(pid: pid).last(where: { $0["cmd"] as? String == "fps" })?["value"] as? Int == Int(settings.fps),
+                        "Wake did not replace stale renderer playback options")
+            model.pauseAll()
+            model.muteAll()
+            try await waitUntil("\(kind) manual pause") { playbackCommands().last?["state"] as? String == "pause" }
+            let beforePausedWake = playbackCommands().count
+            settingsModel.handlePlaybackLifecycleEvent(.systemSleep)
+            settingsModel.handlePlaybackLifecycleEvent(.displayWake)
+            try await waitUntil("\(kind) manual pause survives wake") {
+                playbackCommands().count > beforePausedWake && playbackCommands().last?["state"] as? String == "pause"
+            }
+            if kind == "web" {
+                try require(playbackCommands().last?["muted"] as? Bool == true, "Wake cleared manual web mute")
+            } else {
+                try require(commands(pid: pid).last(where: { $0["cmd"] as? String == "muted" })?["value"] as? Bool == true,
+                            "Wake cleared manual mute")
+            }
+            settingsModel.handlePlaybackLifecycleEvent(.systemSleep)
+            model.applyPlaybackPolicy(.stop)
+            try await waitUntil("\(kind) policy stop") { !model.renderer.hasCoverageOrWork(onDisplay: display.displayID) }
+            let restarted = await render(model.renderer, wallpaper, display: display.displayID)
+            try require(restarted, "Could not simulate a renderer outliving its cached stop policy")
+            model.applyPlaybackPolicy(.stop, force: true)
+            try await waitUntil("\(kind) forced stop") { !model.renderer.hasCoverageOrWork(onDisplay: display.displayID) }
+            model.applyPlaybackPolicy(.keepRunning, force: true)
+            try await waitUntil("\(kind) restore after stop") { model.renderer.isRendering(onDisplay: display.displayID) }
+            model.renderer.stopAllAndWait()
+            print("PASS: \(kind) wake command replay, manual pause/mute preservation, forced stop and restore")
         }
     }
 
@@ -965,6 +1192,9 @@ private struct UIResponsivenessRegression {
         let fails = CommandLine.arguments.dropFirst().first?.contains("fail-activate") == true
         var activated = false
         var snapshotRequests = 0
+        let commandLog = ProcessInfo.processInfo.environment["MIRAGE_PLAYBACK_POLICY_COMMAND_LOG"]
+            .flatMap { try? FileHandle(forWritingTo: URL(fileURLWithPath: $0)) }
+        defer { try? commandLog?.close() }
         func emit(_ event: String, _ fields: [String: Any] = [:]) {
             var object = fields
             object["event"] = event
@@ -976,6 +1206,15 @@ private struct UIResponsivenessRegression {
         emit(CommandLine.arguments.contains("--no-spectrum") ? "first-frame-presented" : "prepared")
         while let line = readLine(), let data = line.data(using: .utf8) {
             guard let command = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            if let commandLog {
+                var entry = command
+                entry["pid"] = ProcessInfo.processInfo.processIdentifier
+                if var encoded = try? JSONSerialization.data(withJSONObject: entry) {
+                    encoded.append(10)
+                    _ = try? commandLog.seekToEnd()
+                    try? commandLog.write(contentsOf: encoded)
+                }
+            }
             switch command["cmd"] as? String {
             case "activate":
                 activated = true

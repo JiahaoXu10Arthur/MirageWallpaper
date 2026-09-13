@@ -18,6 +18,7 @@ def main():
                         default=Path(tempfile.gettempdir()) / "MirageUIRegressionBuild")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--startup-playlist", action="store_true")
+    parser.add_argument("--playback-policy", action="store_true")
     parser.add_argument("--configuration", choices=["Debug", "Release"], default="Debug")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--baseline-api", action="store_true")
@@ -72,6 +73,8 @@ def main():
         command = [str(executable)]
         if args.startup_playlist:
             command.append("--startup-playlist")
+        if args.playback_policy:
+            command.append("--playback-policy")
         result = subprocess.run(command, cwd=artifacts, env=env,
                                 stderr=log, timeout=90)
     if result.returncode:
