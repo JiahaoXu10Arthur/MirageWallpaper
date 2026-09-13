@@ -165,12 +165,13 @@ enum WEHTML {
 // forwarded to the enclosing ScrollView.
 struct RichHTMLText: View {
     let html: String
+    @Environment(\.mirageContentActive) private var isActive
     @State private var attributed: AttributedString?
     @State private var loadedHTML: String?
 
     var body: some View {
         Group {
-            if WEHTML.needsWebView(html) {
+            if isActive && WEHTML.needsWebView(html) {
                 RichHTMLWebViewHost(html: html)
             } else {
                 Text(loadedHTML == html ? (attributed ?? AttributedString(WEHTML.plain(html)))
@@ -179,8 +180,8 @@ struct RichHTMLText: View {
                     .textSelection(.enabled)
             }
         }
-        .task(id: html) {
-            guard !WEHTML.needsWebView(html) else { return }
+        .task(id: isActive ? html : nil) {
+            guard isActive, !WEHTML.needsWebView(html) else { return }
             let result = await WEHTML.attributed(html)
             guard !Task.isCancelled else { return }
             attributed = result

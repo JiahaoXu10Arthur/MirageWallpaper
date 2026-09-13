@@ -108,11 +108,22 @@ class WorkshopViewModel {
     var presetDependencyPrompt: PresetDependencyPrompt?
 
     private(set) var subscriptionRecords: [WorkshopSubscription] = []
-    private(set) var subscriptionCatalogItems: [WorkshopItem] = []
+    private(set) var subscriptionCatalogItems: [WorkshopItem] = [] {
+        didSet {
+            subscriptionCatalogRevision &+= 1
+            subscriptionFilterWorker.cancel()
+            cachedSubscriptionFilter = nil
+            if subscriptionCatalogItems.isEmpty {
+                filteredSubscriptionItems = []
+                isFilteringSubscriptions = false
+            }
+        }
+    }
     private(set) var subscriptionItems: [WorkshopItem] = []
     private(set) var subscriptionTotal = 0
     private(set) var subscriptionStartIndex = 0
     private(set) var isLoadingSubscriptions = false
+    private(set) var isFilteringSubscriptions = false
     private(set) var subscriptionsError: String?
     var subscriptionSearchText = "" {
         didSet {
@@ -267,7 +278,60 @@ class WorkshopViewModel {
         return [10, 25, 50].contains(value) ? value : 50
     }
 
-    init() {
+    struct SubscriptionFilter: Equatable {
+        var query: String
+        var showOnly: FRShowOnly
+        var favorites: Set<String>
+        var types: Set<WorkshopTypeFilter>
+        var ageRating: WorkshopAgeRatingFilter
+        var tags: Set<String>
+        var widescreen: FRWidescreenResolution
+        var ultraWidescreen: FRUltraWidescreenResolution
+        var dualscreen: FRDualscreenResolution
+        var triplescreen: FRTriplescreenResolution
+        var portrait: FRPortraitScreenResolution
+        var misc: FRMiscResolution
+
+        func matches(_ item: WorkshopItem) -> Bool {
+            guard showOnly.matches(workshopItem: item, favoriteIDs: favorites),
+                  types.matches(item) else { return false }
+            if !query.isEmpty {
+                let values = [item.title, item.itemDescription, item.creatorDisplayName,
+                              item.creatorSteamId, item.publishedFileId] + item.tags
+                guard values.contains(where: { $0.localizedCaseInsensitiveContains(query) }) else { return false }
+            }
+            if !ageRating.isEmpty, ageRating != .all,
+               !ageRating.contains(item.ageRating ?? .everyone) { return false }
+            if !tags.isEmpty,
+               !item.tags.contains(where: { tags.contains($0.lowercased()) }) { return false }
+            return FRResolutionFilter.matches(tags: item.tags, widescreen: widescreen,
+                ultraWidescreen: ultraWidescreen, dualscreen: dualscreen, triplescreen: triplescreen,
+                portrait: portrait, misc: misc)
+        }
+    }
+
+    private struct SubscriptionFilterInput {
+        let items: [WorkshopItem]
+        let filter: SubscriptionFilter
+    }
+
+    @ObservationIgnored private var subscriptionCatalogRevision: UInt64 = 0
+    @ObservationIgnored private var cachedSubscriptionRevision: UInt64 = 0
+    @ObservationIgnored private var cachedSubscriptionFilter: SubscriptionFilter?
+    @ObservationIgnored private var filteredSubscriptionItems: [WorkshopItem] = []
+    @ObservationIgnored private var subscriptionFilterScheduled = false
+    @ObservationIgnored private var requestedSubscriptionStart = 0
+    @ObservationIgnored private let subscriptionFilterWorker = LatestValueWorker<SubscriptionFilterInput, [WorkshopItem]>(
+        label: "cn.laobamac.Mirage.subscriptions.filter") { input in
+            input.items.filter(input.filter.matches)
+        }
+
+    init(subscriptionCatalog: [WorkshopItem]? = nil) {
+        if let subscriptionCatalog {
+            subscriptionCatalogItems = subscriptionCatalog
+            rebuildSubscriptionPage(startIndex: 0)
+            return
+        }
         workshopShowOnly = Self.storedShowOnly(forKey: Self.workshopShowOnlyStorageKey)
         subscriptionShowOnly = Self.storedShowOnly(forKey: Self.subscriptionShowOnlyStorageKey)
         if let stored = UserDefaults.standard.object(forKey: Self.ageRatingStorageKey) as? Int {
@@ -314,9 +378,6 @@ class WorkshopViewModel {
                 self.refreshSetupState()
                 guard isLoggedIn else { return }
                 self.processDownloadQueue()
-                if self.subscriptionCatalogItems.isEmpty && !self.isLoadingSubscriptions {
-                    self.refreshSubscriptions(startIndex: 0)
-                }
                 if let item = self.selectedItem {
                     self.refreshSubscriptionStates(for: [item])
                     self.loadComments(for: item, startIndex: 0)
@@ -1790,55 +1851,58 @@ class WorkshopViewModel {
     }
 
     private func rebuildSubscriptionPage(startIndex: Int) {
-        let filtered = subscriptionCatalogItems.filter(matchesSubscriptionFilters)
+        requestedSubscriptionStart = startIndex
+        let filter = currentSubscriptionFilter()
+        subscriptionFilterWorker.cancel()
+        if cachedSubscriptionFilter == filter, cachedSubscriptionRevision == subscriptionCatalogRevision {
+            isFilteringSubscriptions = false
+            publishSubscriptionPage()
+            return
+        }
+        isFilteringSubscriptions = true
+        guard !subscriptionFilterScheduled else { return }
+        subscriptionFilterScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.subscriptionFilterScheduled = false
+            let revision = self.subscriptionCatalogRevision
+            let filter = self.currentSubscriptionFilter()
+            if self.cachedSubscriptionFilter == filter, self.cachedSubscriptionRevision == revision {
+                self.isFilteringSubscriptions = false
+                self.publishSubscriptionPage()
+                return
+            }
+            self.subscriptionFilterWorker.submit(.init(items: self.subscriptionCatalogItems, filter: filter)) { [weak self] items in
+                guard let self, self.subscriptionCatalogRevision == revision,
+                      self.currentSubscriptionFilter() == filter else { return }
+                self.filteredSubscriptionItems = items
+                self.cachedSubscriptionFilter = filter
+                self.cachedSubscriptionRevision = revision
+                self.isFilteringSubscriptions = false
+                self.publishSubscriptionPage()
+            }
+        }
+    }
+
+    private func publishSubscriptionPage() {
+        let filtered = filteredSubscriptionItems
         let maximumStart = filtered.isEmpty ? 0 : (filtered.count - 1) / subscriptionPageSize * subscriptionPageSize
-        let clampedStart = min(max(0, startIndex), maximumStart)
+        let clampedStart = min(max(0, requestedSubscriptionStart), maximumStart)
         subscriptionTotal = filtered.count
         subscriptionStartIndex = clampedStart
         subscriptionItems = Array(filtered.dropFirst(clampedStart).prefix(subscriptionPageSize))
     }
 
-    private func matchesSubscriptionFilters(_ item: WorkshopItem) -> Bool {
-        if !subscriptionShowOnly.matches(
-            workshopItem: item,
-            favoriteIDs: SteamServiceManager.shared.workshopFavoriteIDs
-        ) {
-            return false
-        }
-
-        let query = subscriptionSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !query.isEmpty {
-            let searchableValues = [
-                item.title,
-                item.itemDescription,
-                item.creatorDisplayName,
-                item.creatorSteamId,
-                item.publishedFileId
-            ] + item.tags
-            guard searchableValues.contains(where: { $0.localizedCaseInsensitiveContains(query) }) else {
-                return false
-            }
-        }
-
-        guard subscriptionSelectedTypeFilters.matches(item) else { return false }
-
-        if !subscriptionAgeRatingFilter.isEmpty,
-           subscriptionAgeRatingFilter != .all,
-           !subscriptionAgeRatingFilter.contains(item.ageRating ?? .everyone) {
-            return false
-        }
-
+    private func currentSubscriptionFilter() -> SubscriptionFilter {
         let selectableTags = Set(WorkshopTag.allCases.map(\.rawValue))
-        if !subscriptionSelectedTags.isEmpty,
-           !selectableTags.isSubset(of: subscriptionSelectedTags) {
-            let itemTags = Set(item.tags.map { $0.lowercased() })
-            guard subscriptionSelectedTags.contains(where: { itemTags.contains($0.lowercased()) }) else {
-                return false
-            }
-        }
-
-        return FRResolutionFilter.matches(
-            tags: item.tags,
+        return SubscriptionFilter(
+            query: subscriptionSearchText.trimmingCharacters(in: .whitespacesAndNewlines),
+            showOnly: subscriptionShowOnly,
+            favorites: workshopFavoriteIDs,
+            types: subscriptionSelectedTypeFilters,
+            ageRating: subscriptionAgeRatingFilter,
+            tags: selectableTags.isSubset(of: subscriptionSelectedTags)
+                ? [] : Set(subscriptionSelectedTags.map { $0.lowercased() }),
             widescreen: subscriptionWidescreenResolution,
             ultraWidescreen: subscriptionUltraWidescreenResolution,
             dualscreen: subscriptionDualscreenResolution,
@@ -1929,15 +1993,22 @@ class WorkshopViewModel {
         selectedItem = item
         showCustomization = false
         if let wallpaper = cachedInstalledWallpapers[item.publishedFileId] {
+            showCustomization = true
             let model = AppDelegate.shared.wallpaperViewModel
             let key = model.selectedDisplayKey
             model.prepareWallpaper(wallpaper, for: key) { [weak self, weak model] fresh in
-                guard let self, let model, self.selectionGeneration == generation else { return }
+                guard let self, let model else { return }
+                guard self.selectionGeneration == generation else {
+                    model.cancelPendingPreview(wallpaperID: fresh.id, for: key)
+                    return
+                }
                 if fresh.needsPresetDependency {
                     self.requestPresetDependency(for: fresh)
                 } else if fresh.presentationIsValid {
                     model.requestPreparedWallpaper(fresh, to: key)
                     self.showCustomization = true
+                } else {
+                    self.showCustomization = false
                 }
             }
         }
@@ -2109,10 +2180,17 @@ class WorkshopViewModel {
         let key = model.selectedDisplayKey
         selectionGeneration += 1
         let generation = selectionGeneration
+        showCreatorProfile = false
+        selectedCreator = nil
+        showCustomization = true
+        selectedItem = nil
         model.prepareWallpaper(wallpaper, for: key) { [weak self, weak model] fresh in
             guard let self, let model else { return }
             if fresh.needsPresetDependency {
-                guard self.selectionGeneration == generation else { return }
+                guard self.selectionGeneration == generation else {
+                    model.cancelPendingPreview(wallpaperID: fresh.id, for: key)
+                    return
+                }
                 self.showCreatorProfile = false
                 self.selectedCreator = nil
                 self.requestPresetDependency(for: fresh)
@@ -2195,6 +2273,13 @@ class WorkshopViewModel {
     }
 
     func dismissPresetDependencyPrompt() {
+        if let prompt = presetDependencyPrompt {
+            let model = AppDelegate.shared.wallpaperViewModel
+            let wallpaper = model.previewWallpaper
+            if wallpaper.wallpaperDirectory.lastPathComponent == prompt.presetID {
+                model.cancelPendingPreview(wallpaperID: wallpaper.id)
+            }
+        }
         presetDependencyPrompt = nil
         pendingCreatorPresetApplication = nil
     }

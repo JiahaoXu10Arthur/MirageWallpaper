@@ -59,3 +59,32 @@ final class LatestValueWorker<Input, Output>: @unchecked Sendable {
         }
     }
 }
+
+final class LatestValueThrottler<Key: Hashable> {
+    private let interval: TimeInterval
+    private var work: [Key: DispatchWorkItem] = [:]
+    private var actions: [Key: () -> Void] = [:]
+
+    init(interval: TimeInterval = 1.0 / 60.0) { self.interval = interval }
+
+    func submit(key: Key, action: @escaping () -> Void) {
+        actions[key] = action
+        guard work[key] == nil else { return }
+        let item = DispatchWorkItem { [weak self] in self?.flush(key: key) }
+        work[key] = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval, execute: item)
+    }
+
+    func flush(key: Key) {
+        work.removeValue(forKey: key)?.cancel()
+        let action = actions.removeValue(forKey: key)
+        action?()
+    }
+
+    func cancel(key: Key) {
+        work.removeValue(forKey: key)?.cancel()
+        actions[key] = nil
+    }
+
+    deinit { work.values.forEach { $0.cancel() } }
+}

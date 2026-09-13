@@ -14,7 +14,9 @@ final class WEConditionEvaluator {
     private struct Request {
         let identity: String
         let conditions: [String]
-        let values: [String: Any]
+        var values: [String: Any]
+        var properties: [String: WEProjectProperty]?
+        var overrides: [String: WEPropertyValue] = [:]
     }
 
     private let worker: Worker
@@ -27,8 +29,27 @@ final class WEConditionEvaluator {
                             evaluationTimeout: evaluationTimeout,
                             startupTimeout: startupTimeout)
         self.worker = worker
-        pipeline = LatestValueWorker(label: "cn.laobamac.Mirage.conditions") {
-            worker.evaluate($0)
+        pipeline = LatestValueWorker(label: "cn.laobamac.Mirage.conditions") { input in
+            var request = input
+            if let properties = request.properties {
+                for (key, property) in properties {
+                    let raw = request.overrides[key] ?? property.value
+                    let value: Any
+                    switch raw {
+                    case .bool(let flag): value = flag
+                    case .number(let number): value = number
+                    case .string(let string):
+                        if property.propertyType == .bool { value = (string as NSString).boolValue }
+                        else if let integer = Int(string) { value = integer }
+                        else if let number = Double(string) { value = number }
+                        else if string == "true" { value = true }
+                        else if string == "false" { value = false }
+                        else { value = string }
+                    }
+                    request.values[key] = ["value": value]
+                }
+            }
+            return worker.evaluate(request)
         }
     }
 
@@ -41,6 +62,12 @@ final class WEConditionEvaluator {
     func cancel() {
         pipeline.cancel()
         worker.cancel()
+    }
+
+    func evaluate(identity: String, conditions: [String], properties: [String: WEProjectProperty],
+                  overrides: [String: WEPropertyValue], completion: @escaping ([String: Bool]) -> Void) {
+        pipeline.submit(Request(identity: identity, conditions: conditions, values: [:],
+                                properties: properties, overrides: overrides), completion: completion)
     }
 
     deinit {

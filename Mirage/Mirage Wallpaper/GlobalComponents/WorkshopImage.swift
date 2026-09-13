@@ -9,6 +9,17 @@ import CryptoKit
 import ImageIO
 import SwiftUI
 
+private struct MirageContentActiveKey: EnvironmentKey {
+    static let defaultValue = true
+}
+
+extension EnvironmentValues {
+    var mirageContentActive: Bool {
+        get { self[MirageContentActiveKey.self] }
+        set { self[MirageContentActiveKey.self] = newValue }
+    }
+}
+
 final class WorkshopImageLoader {
     static let shared = WorkshopImageLoader()
 
@@ -419,10 +430,11 @@ struct WorkshopImage: View {
     var preloadsWhenInactive: Bool
 
     @Environment(\.displayScale) private var displayScale
+    @Environment(\.mirageContentActive) private var contentActive
     @State private var image: NSImage?
     @State private var animation: NSImage?
     @State private var failed = false
-    @State private var boxSize: CGSize = .zero
+    @State private var pixelSize = 0
     @State private var requestID: UUID?
     @State private var loadToken: UInt64 = 0
     @State private var loadedKey: String?
@@ -456,7 +468,7 @@ struct WorkshopImage: View {
                         .resizable()
                         .interpolation(.high)
                         .aspectRatio(contentMode: contentMode)
-                    if isAnimating, let animation, let source {
+                    if contentActive && isLoadingEnabled && isAnimating, let animation, let source {
                         WorkshopAnimatedImage(image: animation, identity: source.key, contentMode: contentMode)
                     }
                 } else if failed {
@@ -468,13 +480,13 @@ struct WorkshopImage: View {
                 }
             }
             .clipped()
-            .onAppear { load() }
             .background(
                 GeometryReader { proxy in
+                    let pixels = proxy.size.width > 1 && proxy.size.height > 1
+                        ? WorkshopImageLoader.pixels(for: proxy.size, scale: displayScale) : 0
                     Color.clear
-                        .onAppear { boxSize = proxy.size; load() }
-                        .onChange(of: proxy.size) { _, size in
-                            boxSize = size
+                        .task(id: pixels) {
+                            pixelSize = pixels
                             load()
                         }
                 }
@@ -487,12 +499,17 @@ struct WorkshopImage: View {
                 load()
             }
             .onChange(of: isLoadingEnabled) { _, _ in load() }
+            .onChange(of: contentActive) { _, active in
+                if !active { animation = nil }
+                load()
+            }
             .onChange(of: isAnimating) { _, active in
                 if !active { animation = nil }
                 load()
             }
             .onDisappear {
                 cancel()
+                image = nil
                 animation = nil
             }
     }
@@ -505,14 +522,18 @@ struct WorkshopImage: View {
     }
 
     private func load() {
-        guard boxSize.width > 1, boxSize.height > 1 else { return }
+        guard pixelSize > 0 else { return }
         guard let source else {
             failed = true
             return
         }
-        guard isLoadingEnabled || preloadsWhenInactive else { cancel(); return }
+        guard contentActive && (isLoadingEnabled || preloadsWhenInactive) else {
+            cancel()
+            animation = nil
+            return
+        }
         let variant = WorkshopImageLoader.Variant(
-            pixels: WorkshopImageLoader.pixels(for: boxSize, scale: displayScale),
+            pixels: pixelSize,
             animated: isAnimating && isLoadingEnabled)
         let key = "\(source.key)#\(variant.pixels)#\(variant.animated)"
         if loadedKey == key {

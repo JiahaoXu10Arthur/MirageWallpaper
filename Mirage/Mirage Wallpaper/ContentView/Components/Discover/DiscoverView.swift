@@ -32,7 +32,8 @@ struct DiscoverView: View {
         .contextMenu {
             WallpaperGridViewMenu(viewModel: viewModel)
         }
-        .onAppear {
+        .task(id: isActive) {
+            guard isActive else { return }
             if workshopViewModel.discoverRows.isEmpty {
                 workshopViewModel.loadDiscover()
             }

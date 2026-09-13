@@ -68,7 +68,8 @@ struct DiscoverSectionView: View {
                 }
             }
         }
-        .onAppear {
+        .task(id: isActive) {
+            guard isActive else { return }
             workshopViewModel.loadDiscoverRow(id: row.id)
         }
     }
@@ -200,7 +201,7 @@ struct DiscoverCard: View {
                 contentMode: .fill,
                 isAnimating: isActive && (isHovered || isSelected || animatedPreviewMode == .visible),
                 isLoadingEnabled: isActive,
-                preloadsWhenInactive: true
+                preloadsWhenInactive: false
             )
             .frame(width: cardWidth, height: cardWidth)
             .clipped()

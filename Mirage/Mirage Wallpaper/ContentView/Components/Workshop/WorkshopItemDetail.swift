@@ -31,8 +31,8 @@ struct WorkshopItemDetail: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .task(id: item?.publishedFileId) {
-            guard let item else { return }
+        .task(id: isActive ? item?.publishedFileId : nil) {
+            guard isActive, let item else { return }
             workshopViewModel.prepareWorkshopInteractions(for: item)
         }
         .confirmationDialog(
@@ -56,7 +56,8 @@ struct WorkshopItemDetail: View {
                 WorkshopImage(
                     url: item.previewImageURL,
                     contentMode: .fill,
-                    isAnimating: isActive
+                    isAnimating: isActive,
+                    isLoadingEnabled: isActive
                 )
                     .frame(width: 280, height: 280)
                     .clipShape(RoundedRectangle(cornerRadius: 12))

@@ -24,7 +24,7 @@ struct WallpaperExplorer: SubviewOfContentView {
 
     var body: some View {
         let page = viewModel.wallpaperPage
-        let selectedDirectory = wallpaperViewModel.currentWallpaper.wallpaperDirectory
+        let selectedDirectory = wallpaperViewModel.previewWallpaper.wallpaperDirectory
         let currentPage = min(max(viewModel.currentPage, 1), page.pageCount)
         ScrollViewReader { proxy in
             ZStack(alignment: .bottom) {

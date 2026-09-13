@@ -19,22 +19,11 @@ struct PropertyEditor: View {
 
     @StateObject private var conditions = ConditionStore()
 
-    private var allProperties: [String: WEProjectProperty] {
-        wallpaper.project.general?.properties?.items ?? [:]
-    }
-
-    private var sortedProperties: [(key: String, property: WEProjectProperty)] {
-        (wallpaper.project.general?.properties?.sorted ?? []).filter { !$0.property.isPresetOnly }
-    }
-
-    private var visibleProperties: [(key: String, property: WEProjectProperty)] {
-        sortedProperties.filter { conditions.isVisible($0.property.condition) }
-    }
-
     var body: some View {
         @Bindable var wallpaperViewModel = wallpaperViewModel
+        let model = wallpaperViewModel.propertyModel
         Group {
-            if sortedProperties.isEmpty {
+            if model.rows.isEmpty {
                 HStack {
                     Text("此壁纸没有可调节的属性。")
                         .font(.footnote)
@@ -42,19 +31,36 @@ struct PropertyEditor: View {
                     Spacer()
                 }
             } else {
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(visibleProperties, id: \.key) { entry in
-                        PropertyRow(wallpaper: wallpaper, key: entry.key,
-                                    property: entry.property, conditions: conditions)
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    ForEach(model.rows.filter { conditions.isVisible($0.property.condition) }) { entry in
+                        PropertyRow(wallpaper: wallpaper, key: entry.id,
+                                    property: entry.property, valueState: entry.state,
+                                    displayKey: wallpaperViewModel.selectedDisplayKey, conditions: conditions)
                             .environment(wallpaperViewModel)
                     }
                 }
             }
         }
+        .background {
+            PropertyConditionObserver(model: model, identity: wallpaper.id,
+                                      conditions: conditions, isActive: isActive)
+        }
+        .environment(\.mirageContentActive, isActive)
+    }
+}
+
+private struct PropertyConditionObserver: View {
+    let model: WallpaperPropertyModel
+    let identity: String
+    let conditions: ConditionStore
+    let isActive: Bool
+
+    var body: some View {
+        Color.clear
         .onAppear { refreshConditions() }
-        .onChange(of: isActive ? wallpaperViewModel.runtime.propertyOverrides : [:]) { _, _ in refreshConditions() }
-        .onChange(of: wallpaper.id) { _, _ in refreshConditions() }
-        .onChange(of: allProperties) { _, _ in refreshConditions() }
+        .onChange(of: isActive ? model.overrides : [:]) { _, _ in refreshConditions() }
+        .onChange(of: identity) { _, _ in refreshConditions() }
+        .onChange(of: model.properties) { _, _ in refreshConditions() }
         .onChange(of: isActive) { _, active in
             if active { refreshConditions() } else { conditions.cancel() }
         }
@@ -63,8 +69,7 @@ struct PropertyEditor: View {
 
     private func refreshConditions() {
         guard isActive else { return }
-        conditions.update(identity: wallpaper.id, properties: allProperties,
-                          overrides: wallpaperViewModel.runtime.propertyOverrides)
+        conditions.update(identity: identity, properties: model.properties, overrides: model.overrides)
     }
 }
 
@@ -74,6 +79,7 @@ final class ConditionStore: ObservableObject {
     private var identity: String?
     private var lastProperties: [String: WEProjectProperty]?
     private var lastOverrides: [String: WEPropertyValue]?
+    private var expressions: [String] = []
 
     func update(identity: String, properties: [String: WEProjectProperty],
                 overrides: [String: WEPropertyValue]) {
@@ -85,32 +91,26 @@ final class ConditionStore: ObservableObject {
             verdicts = [:]
         }
         self.identity = identity
-        lastProperties = properties
-        lastOverrides = overrides
-        var expressions = Set<String>()
-        var values: [String: Any] = [:]
-        for (key, property) in properties {
-            for expression in [property.condition] + (property.options ?? []).map(\.condition) {
-                if let expression, !expression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    expressions.insert(expression)
+        if lastProperties != properties {
+            var unique = Set<String>()
+            for property in properties.values {
+                for expression in [property.condition] + (property.options ?? []).map(\.condition) {
+                    if let expression, !expression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        unique.insert(expression)
+                    }
                 }
             }
-            let raw = overrides[key] ?? property.value
-            let value: Any
-            switch raw {
-            case .bool(let flag): value = flag
-            case .number(let number): value = number
-            case .string(let string):
-                if property.propertyType == .bool { value = (string as NSString).boolValue }
-                else if let integer = Int(string) { value = integer }
-                else if let number = Double(string) { value = number }
-                else if string == "true" { value = true }
-                else if string == "false" { value = false }
-                else { value = string }
-            }
-            values[key] = ["value": value]
+            expressions = unique.sorted()
         }
-        evaluator.evaluate(identity: identity, conditions: expressions.sorted(), values: values) { [weak self] result in
+        lastProperties = properties
+        lastOverrides = overrides
+        guard !expressions.isEmpty else {
+            evaluator.cancel()
+            if !verdicts.isEmpty { verdicts = [:] }
+            return
+        }
+        evaluator.evaluate(identity: identity, conditions: expressions,
+                           properties: properties, overrides: overrides) { [weak self] result in
             guard let self, self.identity == identity, self.verdicts != result else { return }
             self.verdicts = result
         }
@@ -135,11 +135,18 @@ struct PropertyRow: View {
     let wallpaper: WEWallpaper
     let key: String
     let property: WEProjectProperty
+    let valueState: WallpaperPropertyValue
+    let displayKey: DisplayKey
     @ObservedObject var conditions: ConditionStore
     @State private var pickerError: String?
 
     private var currentValue: WEPropertyValue {
-        wallpaperViewModel.runtime.propertyOverrides[key] ?? property.value
+        valueState.value
+    }
+
+    private func setValue(_ value: WEPropertyValue) {
+        guard wallpaperViewModel.state(for: displayKey)?.wallpaper.id == wallpaper.id else { return }
+        wallpaperViewModel.setProperty(key: key, value: value, for: displayKey)
     }
 
     private var rawText: String { property.displayText(fallbackKey: key) }
@@ -165,7 +172,7 @@ struct PropertyRow: View {
         case .bool:
             Toggle(isOn: Binding(
                 get: { currentValue.boolValue },
-                set: { wallpaperViewModel.setProperty(key: key, value: .bool($0)) })) {
+                set: { setValue(.bool($0)) })) {
                 labelView()
             }
 
@@ -183,15 +190,18 @@ struct PropertyRow: View {
                         get: { currentValue.doubleValue },
                         set: { newVal in
                             let v = (property.fraction == true) ? newVal : newVal.rounded()
-                            wallpaperViewModel.setProperty(key: key, value: .number(v))
+                            setValue(.number(v))
                         }),
-                    in: sliderRange)
+                    in: sliderRange,
+                    onEditingChanged: { editing in
+                        if !editing { wallpaperViewModel.flushInteractiveChanges(for: displayKey) }
+                    })
             }
 
         case .color:
             ColorPicker(selection: Binding(
                 get: { Self.parseColor(currentValue.stringValue) },
-                set: { wallpaperViewModel.setProperty(key: key, value: .string(Self.encodeColor($0))) }),
+                set: { setValue(.string(Self.encodeColor($0))) }),
                 supportsOpacity: false) {
                 labelView(lineLimit: 2)
             }
@@ -202,7 +212,7 @@ struct PropertyRow: View {
                 Spacer()
                 Picker("", selection: Binding(
                     get: { property.normalizedComboValue(currentValue) },
-                    set: { wallpaperViewModel.setProperty(key: key, value: $0) })) {
+                    set: { setValue($0) })) {
                     ForEach(visibleOptions, id: \.value) { opt in
                         Text(WELocalization.resolve(opt.label)).tag(opt.value)
                     }
@@ -216,7 +226,7 @@ struct PropertyRow: View {
                 labelView(lineLimit: 2)
                 TextField("", text: Binding(
                     get: { currentValue.stringValue },
-                    set: { wallpaperViewModel.setProperty(key: key, value: .string($0)) }))
+                    set: { setValue(.string($0)) }))
                     .textFieldStyle(.roundedBorder)
             }
 
@@ -252,7 +262,7 @@ struct PropertyRow: View {
                 Spacer()
                 TextField("快捷方式", text: Binding(
                     get: { currentValue.stringValue },
-                    set: { wallpaperViewModel.setProperty(key: key, value: .string($0)) }))
+                    set: { setValue(.string($0)) }))
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 170)
                 Button {
@@ -300,7 +310,7 @@ struct PropertyRow: View {
                 Spacer()
                 if !displayPath.isEmpty {
                     Button {
-                        wallpaperViewModel.setProperty(key: key, value: .string(""))
+                        setValue(.string(""))
                     } label: { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.plain)
                         .foregroundStyle(.secondary)
@@ -328,12 +338,12 @@ struct PropertyRow: View {
             if property.propertyType == .scenetexture {
                 do {
                     let cached = try UserTextureCache.shared.importImage(at: url)
-                    wallpaperViewModel.setProperty(key: key, value: .string(cached.path))
+                    setValue(.string(cached.path))
                 } catch {
                     pickerError = error.localizedDescription
                 }
             } else {
-                wallpaperViewModel.setProperty(key: key, value: .string(url.path))
+                setValue(.string(url.path))
             }
         }
     }
@@ -345,9 +355,7 @@ struct PropertyRow: View {
         panel.treatsFilePackagesAsDirectories = false
         panel.allowsMultipleSelection = false
         if panel.runModal() == .OK, let url = panel.url {
-            wallpaperViewModel.setProperty(
-                key: key,
-                value: .string(url.standardizedFileURL.path))
+            setValue(.string(url.standardizedFileURL.path))
         }
     }
 

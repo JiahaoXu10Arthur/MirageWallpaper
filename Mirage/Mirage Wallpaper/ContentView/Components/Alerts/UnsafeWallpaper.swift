@@ -14,6 +14,7 @@ struct UnsafeWallpaper: View {
     private var wallpaper: WEWallpaper { request.wallpaper }
 
     @State var seconds: Int = 5
+    @State private var continued = false
 
     var typeStringDict: [String : String] =
     [
@@ -88,9 +89,19 @@ struct UnsafeWallpaper: View {
                 }
             }
         }
+        .onDisappear {
+            guard !continued else { return }
+            let model = AppDelegate.shared.wallpaperViewModel
+            if case .applyOnDisplay(let displayID) = request.action {
+                model.cancelPendingPreview(wallpaperID: wallpaper.id, onDisplay: displayID)
+            } else {
+                model.cancelPendingPreview(wallpaperID: wallpaper.id)
+            }
+        }
     }
 
     private func continueApplying(persistently: Bool) {
+        continued = true
         let viewModel = AppDelegate.shared.wallpaperViewModel
         if persistently {
             viewModel.trust(wallpaper)

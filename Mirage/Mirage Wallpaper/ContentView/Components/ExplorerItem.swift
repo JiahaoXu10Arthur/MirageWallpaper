@@ -27,7 +27,7 @@ struct ExplorerItem: View {
                 isAnimating: isActive && (hovering || isSelected ||
                     animatedPreviewMode == .visible),
                 isLoadingEnabled: isActive,
-                preloadsWhenInactive: true
+                preloadsWhenInactive: false
             )
             .scaleEffect(hovering ? 1.03 : 1.0)
             .aspectRatio(1.0, contentMode: .fit)

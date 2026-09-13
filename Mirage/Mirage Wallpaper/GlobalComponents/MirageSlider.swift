@@ -15,13 +15,16 @@ struct MirageSlider<V: BinaryFloatingPoint>: View {
     @Environment(\.isEnabled) private var isEnabled
     let range: ClosedRange<V>
     let step: V?
+    let onEditingChanged: (Bool) -> Void
 
     init(value: Binding<V>,
          in range: ClosedRange<V>,
-         step: V? = nil) {
+         step: V? = nil,
+         onEditingChanged: @escaping (Bool) -> Void = { _ in }) {
         self._value = value
         self.range = range.lowerBound < range.upperBound ? range : range.lowerBound...(range.lowerBound + 1)
         self.step = step
+        self.onEditingChanged = onEditingChanged
     }
 
     @State private var hovering = false
@@ -67,16 +70,31 @@ struct MirageSlider<V: BinaryFloatingPoint>: View {
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { g in
-                        dragging = true
+                        guard isEnabled else { return }
+                        if !dragging {
+                            dragging = true
+                            onEditingChanged(true)
+                        }
                         update(fromX: g.location.x - thumbSize / 2, usable: usable)
                     }
-                    .onEnded { _ in dragging = false }
+                    .onEnded { g in
+                        guard dragging else { return }
+                        update(fromX: g.location.x - thumbSize / 2, usable: usable)
+                        dragging = false
+                        onEditingChanged(false)
+                    }
             )
             .onHover { hovering = $0 }
             .animation(.easeOut(duration: 0.12), value: hovering)
             .animation(.easeOut(duration: 0.12), value: dragging)
         }
         .frame(height: thumbSize)
+        .onDisappear {
+            if dragging {
+                dragging = false
+                onEditingChanged(false)
+            }
+        }
     }
 
     private func update(fromX rawX: CGFloat, usable: CGFloat) {

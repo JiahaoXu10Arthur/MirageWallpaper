@@ -27,7 +27,8 @@ struct SubscribedWorkshopView: View {
 
             content
         }
-        .onAppear {
+        .task(id: isActive) {
+            guard isActive else { return }
             workshopViewModel.checkSteamSetup()
             if steamService.isLoggedIn &&
                 workshopViewModel.subscriptionCatalogItems.isEmpty &&
@@ -36,7 +37,7 @@ struct SubscribedWorkshopView: View {
             }
         }
         .onChange(of: steamService.isLoggedIn) { _, isLoggedIn in
-            if isLoggedIn {
+            if isActive && isLoggedIn && !workshopViewModel.isLoadingSubscriptions {
                 workshopViewModel.refreshSubscriptions(startIndex: 0)
             }
         }

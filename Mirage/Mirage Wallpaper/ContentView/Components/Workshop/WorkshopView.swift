@@ -246,10 +246,11 @@ struct WorkshopView: View {
                 }
             }
         }
-        .onAppear {
+        .task(id: isActive) {
+            guard isActive else { return }
             presentAPIKeyReminderIfNeeded()
             workshopViewModel.checkSteamSetup()
-            if workshopViewModel.items.isEmpty {
+            if workshopViewModel.items.isEmpty && !workshopViewModel.isLoading {
                 workshopViewModel.search()
             }
         }
