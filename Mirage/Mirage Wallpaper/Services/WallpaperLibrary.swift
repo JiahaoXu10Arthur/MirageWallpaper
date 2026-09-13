@@ -619,6 +619,7 @@ final class WallpaperLibrary {
             loadCache.removeAll()
         }
         loadCacheLock.unlock()
+        WEWallpaper.invalidateSizeCache()
         NotificationCenter.default.post(name: .wallpaperLibraryChanged, object: url)
     }
 }

@@ -604,18 +604,7 @@ struct WEWallpaper: Codable, RawRepresentable, Identifiable, Equatable, Hashable
     }
 
     var wallpaperSize: Int {
-        let path = wallpaperDirectory.path(percentEncoded: false)
-        Self.sizeCacheLock.lock()
-        if let cached = Self.sizeCache[path] {
-            Self.sizeCacheLock.unlock()
-            return cached
-        }
-        Self.sizeCacheLock.unlock()
-        let size = (try? wallpaperDirectory.directoryTotalAllocatedSize(includingSubfolders: true)) ?? 0
-        Self.sizeCacheLock.lock()
-        Self.sizeCache[path] = size
-        Self.sizeCacheLock.unlock()
-        return size
+        WallpaperSizeCache.shared.size(at: wallpaperDirectory)
     }
 
     init(using project: WEProject, where url: URL, renderDirectory: URL? = nil,
@@ -643,13 +632,8 @@ struct WEWallpaper: Codable, RawRepresentable, Identifiable, Equatable, Hashable
         case presetDependency, presetStatus
     }
 
-    nonisolated(unsafe) static var sizeCache: [String: Int] = [:]
-    static let sizeCacheLock = NSLock()
-
     static func invalidateSizeCache() {
-        sizeCacheLock.lock()
-        sizeCache.removeAll()
-        sizeCacheLock.unlock()
+        WallpaperSizeCache.shared.invalidate()
     }
 
     init(from decoder: Decoder) throws {
@@ -780,13 +764,19 @@ extension URL {
         return try checkResourceIsReachable()
     }
 
-    func directoryTotalAllocatedSize(includingSubfolders: Bool = false) throws -> Int? {
+    func directoryTotalAllocatedSize(includingSubfolders: Bool = false,
+                                     isCancelled: () -> Bool = { false }) throws -> Int? {
+        guard !isCancelled() else { return nil }
         guard try isDirectoryAndReachable() else { return nil }
         if includingSubfolders {
-            guard let urls = FileManager.default.enumerator(at: self, includingPropertiesForKeys: nil)?.allObjects as? [URL] else { return nil }
-            return try urls.lazy.reduce(0) {
-                (try $1.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize ?? 0) + $0
+            guard let enumerator = FileManager.default.enumerator(at: self,
+                includingPropertiesForKeys: [.totalFileAllocatedSizeKey]) else { return nil }
+            var total = 0
+            for case let url as URL in enumerator {
+                guard !isCancelled() else { return nil }
+                total += try url.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize ?? 0
             }
+            return isCancelled() ? nil : total
         }
         return try FileManager.default.contentsOfDirectory(at: self, includingPropertiesForKeys: nil).lazy.reduce(0) {
             (try $1.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize ?? 0) + $0

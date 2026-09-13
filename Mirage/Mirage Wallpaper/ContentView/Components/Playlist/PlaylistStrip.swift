@@ -10,15 +10,17 @@ import UniformTypeIdentifiers
 struct PlaylistStrip: View {
     @ObservedObject var manager: PlaylistManager
     @Bindable var wallpaperViewModel: WallpaperViewModel
+    @Bindable var contentViewModel: ContentViewModel
     let screen: Int
     @Binding var selectedItemID: String?
+    var isActive = true
 
     private var items: [PlaylistItem] {
         manager.current(on: screen).items
     }
 
     private var libraryByID: [String: WEWallpaper] {
-        Dictionary(uniqueKeysWithValues: AppDelegate.shared.contentViewModel.wallpapers.map { ($0.id, $0) })
+        contentViewModel.wallpapersByID
     }
 
     private var playingID: String? {
@@ -39,6 +41,7 @@ struct PlaylistStrip: View {
                                 wallpaper: libraryByID[item.wallpaperID],
                                 isPlaying: playingID == item.wallpaperID,
                                 isSelected: selectedItemID == item.wallpaperID,
+                                isActive: isActive,
                                 onTap: { tap(item) },
                                 onRemove: { manager.remove(itemID: item.wallpaperID, from: screen) }
                             )
@@ -98,6 +101,7 @@ private struct PlaylistThumb: View {
     let wallpaper: WEWallpaper?
     let isPlaying: Bool
     let isSelected: Bool
+    let isActive: Bool
     let onTap: () -> Void
     let onRemove: () -> Void
 
@@ -173,8 +177,9 @@ private struct PlaylistThumb: View {
         if let wallpaper, !wallpaper.project.preview.isEmpty {
             WorkshopImage(
                 wallpaper: wallpaper, contentMode: .fit,
-                isAnimating: hovering || isPlaying ||
-                    globalSettingsViewModel.animatedPreviewPlaybackMode == .visible
+                isAnimating: isActive && (hovering || isPlaying ||
+                    globalSettingsViewModel.animatedPreviewPlaybackMode == .visible),
+                isLoadingEnabled: isActive
             )
                 .aspectRatio(1.0, contentMode: .fit)
         } else {
