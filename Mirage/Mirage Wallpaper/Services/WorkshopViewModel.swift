@@ -271,7 +271,7 @@ class WorkshopViewModel {
     private var commentGeneration = 0
     private var commentAuthorTask: Task<Void, Never>?
     private var selectionGeneration = 0
-    private var loadedPage = 1
+    private(set) var loadedPage = 1
     private let commentsPageSize = 20
     private var subscriptionPageSize: Int {
         let value = UserDefaults.standard.integer(forKey: "WallpapersPerPage")
