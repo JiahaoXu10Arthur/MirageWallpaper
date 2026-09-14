@@ -326,7 +326,11 @@ class WorkshopViewModel {
             input.items.filter(input.filter.matches)
         }
 
-    init(subscriptionCatalog: [WorkshopItem]? = nil) {
+    typealias PageSearch = (Int) async throws -> (items: [WorkshopItem], total: Int)
+    @ObservationIgnored private let pageSearch: PageSearch?
+
+    init(subscriptionCatalog: [WorkshopItem]? = nil, pageSearch: PageSearch? = nil) {
+        self.pageSearch = pageSearch
         if let subscriptionCatalog {
             subscriptionCatalogItems = subscriptionCatalog
             rebuildSubscriptionPage(startIndex: 0)
@@ -639,7 +643,7 @@ class WorkshopViewModel {
 
     // MARK: - Search
 
-    func search() {
+    func search(page: Int? = nil) {
         searchTask?.cancel()
         searchGeneration += 1
         let generation = searchGeneration
@@ -657,7 +661,7 @@ class WorkshopViewModel {
         let requestPortraitResolution = portraitResolution
         let requestMiscResolution = miscResolution
         let requestTrendPeriod = trendPeriod
-        let requestPage = currentPage
+        let requestPage = page ?? currentPage
         if requestShowOnly.contains(.myFavourites), !SteamServiceManager.shared.isLoggedIn {
             items = []
             totalItems = 0
@@ -675,7 +679,9 @@ class WorkshopViewModel {
             do {
                 let result: (items: [WorkshopItem], total: Int)
                 var matchedCreator: WorkshopCreator?
-                if Self.isPublishedFileId(requestSearchText) {
+                if let pageSearch = self.pageSearch {
+                    result = try await pageSearch(requestPage)
+                } else if Self.isPublishedFileId(requestSearchText) {
                     let details = try await SteamWebAPI.shared.getFileDetails(workshopIds: [requestSearchText])
                     let items = details.filter {
                         $0.publishedFileId == requestSearchText &&
@@ -711,7 +717,7 @@ class WorkshopViewModel {
                 }
 
                 guard !Task.isCancelled, generation == self.searchGeneration else { return }
-                if requestPage > 1, result.items.isEmpty, !self.items.isEmpty {
+                if (page != nil || requestPage > 1), result.items.isEmpty, !self.items.isEmpty {
                     let retainedPage = self.loadedPage
                     if result.total > 0 {
                         self.totalItems = result.total
@@ -728,6 +734,7 @@ class WorkshopViewModel {
                 }
                 self.items = result.items
                 self.totalItems = result.total
+                self.currentPage = requestPage
                 self.loadedPage = requestPage
                 self.rememberCreators(in: result.items)
                 self.refreshSubscriptionStates(for: result.items)
@@ -739,6 +746,10 @@ class WorkshopViewModel {
             } catch {
                 guard !Task.isCancelled, generation == self.searchGeneration else { return }
                 self.error = error.localizedDescription
+                if page != nil {
+                    self.currentPage = self.loadedPage
+                    self.pageNavigationMessage = error.localizedDescription
+                }
                 self.isLoading = false
                 self.steamServiceStatus.browsingAPI = .unavailable(error.localizedDescription)
             }
@@ -848,22 +859,18 @@ class WorkshopViewModel {
     }
 
     func loadNextPage() {
-        guard currentPage < totalPages else { return }
-        currentPage += 1
-        search()
+        goToPage(currentPage + 1)
     }
 
     func loadPreviousPage() {
-        guard currentPage > 1 else { return }
-        currentPage -= 1
-        search()
+        goToPage(currentPage - 1)
     }
 
     func goToPage(_ page: Int) {
+        guard !isLoading else { return }
         let clamped = max(1, min(page, totalPages))
         guard clamped != currentPage else { return }
-        currentPage = clamped
-        search()
+        search(page: clamped)
     }
 
     private static func updatedTypeSelection(

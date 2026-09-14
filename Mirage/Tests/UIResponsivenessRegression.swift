@@ -134,6 +134,11 @@ private struct UIResponsivenessRegression {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             NSApplication.shared.setActivationPolicy(.accessory)
             NSApplication.shared.finishLaunching()
+            if CommandLine.arguments.contains("--workshop-pagination") {
+                try await testWorkshopPagination()
+                print("WorkshopPaginationRegression: all checks passed")
+                return
+            }
             if CommandLine.arguments.contains("--playback-policy") {
                 try testPlaybackPolicyEvaluation()
                 try testPlaybackPolicyInputs()
@@ -159,6 +164,7 @@ private struct UIResponsivenessRegression {
             try await testInteractiveUpdates()
             try await testWallpaperSizes()
             try await testSubscriptionFiltering()
+            try await testWorkshopPagination()
             try await testConditions()
             try testObservation()
             try await testImages()
@@ -669,6 +675,92 @@ private struct UIResponsivenessRegression {
         try require(result.isEmpty && Date().timeIntervalSince(blockedStart) < 2,
                     "A worker that never reads stdin blocked its timeout")
         print("PASS: condition values, exceptions, timeout, main-loop heartbeat and cancellation recovery")
+    }
+
+    static func testWorkshopPagination() async throws {
+        final class SearchProbe {
+            typealias Result = (items: [WorkshopItem], total: Int)
+            var pages: [Int] = []
+            var replies: [CheckedContinuation<Result, Error>] = []
+            func load(_ page: Int) async throws -> Result {
+                pages.append(page)
+                return try await withCheckedThrowingContinuation { replies.append($0) }
+            }
+        }
+        let first = WorkshopItem(publishedFileId: "pagination-1", title: "First page", itemDescription: "",
+            previewImageURL: nil, tags: [], subscriptions: 0, favorited: 0, views: 0, fileSize: 1,
+            timeCreated: Date(), timeUpdated: Date(), creatorSteamId: "", wallpaperType: "video")
+        var second = first
+        second.publishedFileId = "pagination-2"
+        let probe = SearchProbe()
+        let model = WorkshopViewModel(subscriptionCatalog: [], pageSearch: probe.load)
+        let total = model.itemsPerPage * 3
+        model.search()
+        try await waitUntil("initial page request") { probe.replies.count == 1 }
+        probe.replies[0].resume(returning: ([first], total))
+        try await waitUntil("initial page result") { !model.isLoading }
+        try require(model.currentPage == 1 && model.loadedPage == 1, "Initial page was not committed")
+
+        model.goToPage(2)
+        model.goToPage(1)
+        model.goToPage(3)
+        model.loadNextPage()
+        model.loadPreviousPage()
+        try await waitUntil("second page request") { probe.replies.count == 2 }
+        try require(probe.pages == [1, 2] && model.isLoading && model.currentPage == 1 &&
+                    model.loadedPage == 1 && model.items.map(\.id) == [first.id],
+                    "Rapid navigation replaced the pending request or changed the visible page before success")
+        probe.replies[1].resume(returning: ([second], total))
+        try await waitUntil("second page result") { !model.isLoading }
+        try require(model.currentPage == 2 && model.loadedPage == 2 && model.items.map(\.id) == [second.id],
+                    "Successful navigation did not commit page, content and scroll identity together")
+
+        model.goToPage(1)
+        try await waitUntil("failed navigation request") { probe.replies.count == 3 }
+        let failure = NSError(domain: "PaginationRegression", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "Page request failed"])
+        probe.replies[2].resume(throwing: failure)
+        try await waitUntil("failed navigation cleanup") { !model.isLoading }
+        try require(model.currentPage == 2 && model.loadedPage == 2 && model.items.map(\.id) == [second.id] &&
+                    model.pageNavigationMessage == failure.localizedDescription,
+                    "Failed navigation discarded the old page or did not expose a visible error")
+        model.goToPage(1)
+        try await waitUntil("retry request") { probe.replies.count == 4 }
+        probe.replies[3].resume(returning: ([first], total))
+        try await waitUntil("retry completion") { !model.isLoading }
+        try require(model.currentPage == 1 && model.loadedPage == 1 && model.pageNavigationMessage == nil,
+                    "Navigation could not recover after failure")
+
+        model.goToPage(2)
+        try await waitUntil("empty page request") { probe.replies.count == 5 }
+        probe.replies[4].resume(returning: ([], total))
+        try await waitUntil("empty page cleanup") { !model.isLoading }
+        try require(model.currentPage == 1 && model.loadedPage == 1 && model.items.map(\.id) == [first.id] &&
+                    model.pageNavigationMessage != nil, "An empty response discarded the current page")
+        model.loadNextPage()
+        try await waitUntil("next-page recovery") { probe.replies.count == 6 }
+        probe.replies[5].resume(returning: ([second], total))
+        try await waitUntil("next-page recovery result") { !model.isLoading }
+        model.loadPreviousPage()
+        try await waitUntil("empty first-page request") { probe.replies.count == 7 }
+        probe.replies[6].resume(returning: ([], total))
+        try await waitUntil("empty first-page cleanup") { !model.isLoading }
+        try require(model.currentPage == 2 && model.loadedPage == 2 && model.items.map(\.id) == [second.id],
+                    "An empty response when returning to page one discarded the current page")
+
+        // Search/filter changes can still supersede pagination; late callbacks must not unlock it.
+        model.goToPage(3)
+        try await waitUntil("superseded page request") { probe.replies.count == 8 }
+        model.refreshSearch()
+        try await waitUntil("replacement search") { probe.replies.count == 9 }
+        probe.replies[7].resume(throwing: failure)
+        try await Task.sleep(for: .milliseconds(30))
+        try require(model.isLoading && model.currentPage == 2 && model.loadedPage == 2 &&
+                    model.pageNavigationMessage == nil, "A stale failure unlocked or rolled back the replacement search")
+        probe.replies[8].resume(returning: ([second], total))
+        try await waitUntil("replacement completion") { !model.isLoading }
+        try require(probe.pages == [1, 2, 1, 1, 2, 2, 1, 3, 2], "Unexpected requests escaped the pagination lock")
+        print("PASS: pagination lock, committed page identity, failure/empty rollback, retry and stale completion handling")
     }
 
     static func testObservation() throws {

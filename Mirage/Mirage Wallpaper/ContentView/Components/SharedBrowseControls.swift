@@ -4,20 +4,27 @@ import AppKit
 struct PageNavigator: View {
     let currentPage: Int
     let pageCount: Int
+    let isLoading: Bool
     let onSelect: (Int) -> Void
 
     @State private var pageText: String
     @FocusState private var isPageFieldFocused: Bool
 
-    init(currentPage: Int, pageCount: Int, onSelect: @escaping (Int) -> Void) {
+    init(currentPage: Int, pageCount: Int, isLoading: Bool = false, onSelect: @escaping (Int) -> Void) {
         self.currentPage = currentPage
         self.pageCount = max(1, pageCount)
+        self.isLoading = isLoading
         self.onSelect = onSelect
         _pageText = State(initialValue: String(currentPage))
     }
 
     var body: some View {
         HStack(spacing: 6) {
+            if isLoading {
+                ProgressView()
+                    .controlSize(.small)
+            }
+
             Button {
                 select(currentPage - 1)
             } label: {
@@ -82,6 +89,7 @@ struct PageNavigator: View {
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
         }
+        .disabled(isLoading)
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .mirageGlass(
@@ -90,6 +98,9 @@ struct PageNavigator: View {
         )
         .onChange(of: currentPage) { _, value in
             pageText = String(value)
+        }
+        .onChange(of: isLoading) { _, _ in
+            pageText = String(currentPage)
         }
         .onChange(of: pageCount) { _, _ in
             pageText = String(min(max(currentPage, 1), pageCount))
@@ -123,6 +134,7 @@ struct PageNavigator: View {
     }
 
     private func select(_ page: Int) {
+        guard !isLoading else { return }
         let value = min(max(page, 1), pageCount)
         pageText = String(value)
         onSelect(value)

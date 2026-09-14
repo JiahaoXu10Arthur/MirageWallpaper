@@ -117,6 +117,7 @@ struct WorkshopView: View {
                         PageNavigator(
                             currentPage: workshopViewModel.currentPage,
                             pageCount: workshopViewModel.totalPages,
+                            isLoading: workshopViewModel.isLoading,
                             onSelect: workshopViewModel.goToPage
                         )
                         .padding(.bottom, 12)
@@ -153,6 +154,7 @@ struct WorkshopView: View {
                         PageNavigator(
                             currentPage: workshopViewModel.currentPage,
                             pageCount: workshopViewModel.totalPages,
+                            isLoading: workshopViewModel.isLoading,
                             onSelect: workshopViewModel.goToPage
                         )
                         .padding(.bottom, 12)
@@ -230,6 +232,7 @@ struct WorkshopView: View {
                         PageNavigator(
                             currentPage: workshopViewModel.currentPage,
                             pageCount: workshopViewModel.totalPages,
+                            isLoading: workshopViewModel.isLoading,
                             onSelect: workshopViewModel.goToPage
                         )
                         .padding(.bottom, 12)
