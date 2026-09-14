@@ -136,6 +136,7 @@ private struct UIResponsivenessRegression {
             NSApplication.shared.finishLaunching()
             if CommandLine.arguments.contains("--workshop-pagination") {
                 try await testWorkshopPagination()
+                try await testWorkshopSearchCommit()
                 print("WorkshopPaginationRegression: all checks passed")
                 return
             }
@@ -165,6 +166,7 @@ private struct UIResponsivenessRegression {
             try await testWallpaperSizes()
             try await testSubscriptionFiltering()
             try await testWorkshopPagination()
+            try await testWorkshopSearchCommit()
             try await testConditions()
             try testObservation()
             try await testImages()
@@ -752,7 +754,7 @@ private struct UIResponsivenessRegression {
         try await waitUntil("failed navigation cleanup") { !model.isLoading }
         try require(model.currentPage == 2 && model.loadedPage == 2 && model.items.map(\.id) == [second.id] &&
                     model.pageLoadRevision == secondRevision && model.requestedPage == nil &&
-                    model.pageNavigationMessage == failure.localizedDescription,
+                    model.pageNavigationMessage?.contains(failure.localizedDescription) == true && model.error == failure.localizedDescription,
                     "Failed navigation did not retain content/scroll identity or clear the pending target")
         model.goToPage(1)
         try await waitUntil("retry request") { probe.replies.count == 8 }
@@ -792,6 +794,130 @@ private struct UIResponsivenessRegression {
         try await waitUntil("replacement completion") { !model.isLoading }
         try require(probe.pages == [1, 2, 1, 2, 3, 2, 1, 1, 2, 2, 1, 3, 2], "Unexpected pagination requests")
         print("PASS: latest-target navigation, same-page scroll reset, stale success/failure rejection, retained-page errors and retry")
+    }
+
+    static func testWorkshopSearchCommit() async throws {
+        final class SearchProbe {
+            typealias Result = (items: [WorkshopItem], total: Int)
+            var pages: [Int] = []
+            var replies: [CheckedContinuation<Result, Error>] = []
+            func load(_ page: Int) async throws -> Result {
+                pages.append(page)
+                return try await withCheckedThrowingContinuation { replies.append($0) }
+            }
+        }
+        let item = WorkshopItem(publishedFileId: "old-query", title: "Previous results", itemDescription: "",
+            previewImageURL: nil, tags: [], subscriptions: 0, favorited: 0, views: 0, fileSize: 1,
+            timeCreated: Date(), timeUpdated: Date(), creatorSteamId: "", wallpaperType: "video")
+        var newItem = item
+        newItem.publishedFileId = "new-query"
+        let failure = NSError(domain: "SearchCommitRegression", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "Search request failed"])
+        let probe = SearchProbe()
+        let model = WorkshopViewModel(subscriptionCatalog: [], pageSearch: probe.load)
+        let total = model.itemsPerPage * 4
+        model.search()
+        try await waitUntil("initial search") { probe.replies.count == 1 }
+        probe.replies[0].resume(returning: ([item], total))
+        try await waitUntil("initial search completion") { !model.isLoading }
+        model.goToPage(2)
+        try await waitUntil("old query page two") { probe.replies.count == 2 }
+        probe.replies[1].resume(returning: ([item], total))
+        try await waitUntil("old query page two completion") { !model.isLoading }
+        let oldRevision = model.pageLoadRevision
+
+        model.searchText = "New query"
+        model.submitSearch()
+        try await waitUntil("new query page one") { probe.replies.count == 3 }
+        try require(model.currentPage == 2 && model.loadedPage == 2 && model.requestedPage == 1 &&
+                    model.isLoadingNewSearch && model.items.map(\.id) == [item.id] &&
+                    model.pageLoadRevision == oldRevision, "Search changed the displayed page before receiving results")
+        probe.replies[2].resume(throwing: failure)
+        try await waitUntil("new query failure") { !model.isLoading }
+        try require(model.currentPage == 2 && model.loadedPage == 2 && model.requestedPage == nil &&
+                    model.items.map(\.id) == [item.id] && model.totalItems == total &&
+                    model.pageLoadRevision == oldRevision && model.searchText == "New query" &&
+                    model.pageNavigationMessage?.contains(failure.localizedDescription) == true,
+                    "Failed search changed prior content/page or hid the error")
+        model.loadNextPage()
+        try await waitUntil("new query retry via pagination") { probe.replies.count == 4 }
+        try require(probe.pages.last == 1 && model.currentPage == 2,
+                    "Pagination reused the old query's page offset after a new query failed")
+        probe.replies[3].resume(returning: ([newItem], total))
+        try await waitUntil("new query accepted") { !model.isLoading }
+        try require(model.currentPage == 1 && model.items.map(\.id) == [newItem.id] &&
+                    model.pageNavigationMessage == nil && model.error == nil &&
+                    model.pageLoadRevision == oldRevision + 1, "New query did not commit atomically")
+        model.loadNextPage()
+        try await waitUntil("new query page two") { probe.replies.count == 5 }
+        try require(probe.pages.last == 2, "Accepted new query still forced page one")
+        probe.replies[4].resume(returning: ([newItem], total))
+        try await waitUntil("new query page two completion") { !model.isLoading }
+
+        let beforeFilters = model.pageLoadRevision
+        model.selectWorkshopSort(.mostSubscribed)
+        try await waitUntil("sort request") { probe.replies.count == 6 }
+        try require(model.currentPage == 2 && model.requestedPage == 1 && model.isLoadingNewSearch,
+                    "Sorting changed the displayed page before success")
+        model.applyTagFilter("Nature")
+        try await waitUntil("tag request replaces sort") { probe.replies.count == 7 }
+        probe.replies[5].resume(returning: ([item], total))
+        try await Task.sleep(for: .milliseconds(30))
+        try require(model.isLoading && model.currentPage == 2 && model.items.map(\.id) == [newItem.id] &&
+                    model.pageLoadRevision == beforeFilters, "An obsolete query replaced the current results")
+        probe.replies[6].resume(returning: ([], 0))
+        try await waitUntil("empty new query accepted") { !model.isLoading }
+        try require(model.currentPage == 1 && model.loadedPage == 1 && model.items.isEmpty && model.totalItems == 0 &&
+                    model.pageNavigationMessage == nil && model.error == nil &&
+                    model.pageLoadRevision == beforeFilters + 1,
+                    "A successful empty new query incorrectly kept stale results")
+
+        model.searchText = "Another query"
+        model.submitSearch()
+        try await waitUntil("repopulate page one") { probe.replies.count == 8 }
+        probe.replies[7].resume(returning: ([newItem], total))
+        try await waitUntil("repopulate completion") { !model.isLoading }
+        model.goToPage(2)
+        try await waitUntil("repopulate page two") { probe.replies.count == 9 }
+        probe.replies[8].resume(returning: ([newItem], total))
+        try await waitUntil("repopulate page two completion") { !model.isLoading }
+        let beforeRefresh = model.pageLoadRevision
+        model.refreshSearch()
+        try await waitUntil("same-query refresh") { probe.replies.count == 10 }
+        try require(probe.pages.last == 2 && !model.isLoadingNewSearch, "Refresh lost the displayed query's page")
+        probe.replies[9].resume(throwing: failure)
+        try await waitUntil("refresh failure") { !model.isLoading }
+        try require(model.currentPage == 2 && model.pageLoadRevision == beforeRefresh &&
+                    model.pageNavigationMessage?.contains(failure.localizedDescription) == true,
+                    "A non-pagination refresh hid its error or reset the displayed page")
+        model.retrySearch()
+        try await waitUntil("retry failed refresh") { probe.replies.count == 11 }
+        try require(probe.pages.last == 2, "Retry did not target the failed request")
+        probe.replies[10].resume(returning: ([newItem], total))
+        try await waitUntil("refresh retry completion") { !model.isLoading }
+
+        model.goToPage(3)
+        try await waitUntil("failed page three") { probe.replies.count == 12 }
+        probe.replies[11].resume(throwing: failure)
+        try await waitUntil("failed page three completion") { !model.isLoading }
+        model.searchText = "Changed before retry"
+        model.retrySearch()
+        try await waitUntil("retry after editing query") { probe.replies.count == 13 }
+        try require(probe.pages.last == 1, "Retry used a failed page number with different search criteria")
+        probe.replies[12].resume(returning: ([item], total))
+        try await waitUntil("retry after editing query completion") { !model.isLoading }
+        try require(probe.pages == [1, 2, 1, 1, 2, 1, 1, 1, 2, 2, 2, 3, 1], "Unexpected search page sequence")
+
+        let initialProbe = SearchProbe()
+        let initial = WorkshopViewModel(subscriptionCatalog: [], pageSearch: initialProbe.load)
+        initial.search()
+        try await waitUntil("initial failure request") { initialProbe.replies.count == 1 }
+        initialProbe.replies[0].resume(throwing: failure)
+        try await waitUntil("initial failure cleanup") { !initial.isLoading }
+        try require(initial.items.isEmpty && initial.currentPage == 1 && initial.error == failure.localizedDescription &&
+                    initial.pageNavigationMessage == nil && initial.requestedPage == nil,
+                    "Initial failure did not expose the empty-view error state")
+        print("PASS: unified search/filter commits, visible refresh failures, changed-query retry routing and empty results")
     }
 
     static func testObservation() throws {

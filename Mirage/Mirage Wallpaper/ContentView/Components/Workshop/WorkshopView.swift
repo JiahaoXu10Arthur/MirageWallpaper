@@ -83,6 +83,13 @@ struct WorkshopView: View {
                 steamSetupBanner
             }
 
+            if workshopViewModel.isLoadingNewSearch {
+                Text("正在加载新结果，暂时显示上次结果。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             if let message = workshopViewModel.pageNavigationMessage {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -90,6 +97,7 @@ struct WorkshopView: View {
                     Text(message)
                         .font(.caption)
                     Spacer()
+                    Button("重试") { workshopViewModel.retrySearch() }
                     Button {
                         workshopViewModel.pageNavigationMessage = nil
                     } label: {
@@ -138,7 +146,7 @@ struct WorkshopView: View {
                             Text(error)
                                 .font(.caption)
                                 .foregroundStyle(.red)
-                            Button("重试") { workshopViewModel.search() }
+                            Button("重试") { workshopViewModel.retrySearch() }
                                 .buttonStyle(.borderedProminent)
                         } else {
                             Text("没有找到壁纸")

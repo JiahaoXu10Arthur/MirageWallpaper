@@ -61,7 +61,7 @@ class WorkshopViewModel {
     var miscResolution = FRMiscResolution.all {
         didSet { UserDefaults.standard.set(miscResolution.rawValue, forKey: "WorkshopMiscResolution") }
     }
-    var currentPage: Int = 1
+    private(set) var currentPage: Int = 1
     var totalItems: Int = 0
     var isLoading: Bool = false
     var error: String?
@@ -366,8 +366,7 @@ class WorkshopViewModel {
             .debounce(for: .milliseconds(500), scheduler: RunLoop.main)
             .removeDuplicates()
             .sink { [weak self] _ in
-                self?.currentPage = 1
-                self?.search()
+                self?.search(page: 1)
             }
 
         subscriptionSearchDebounce = subscriptionSearchChanges
@@ -397,8 +396,7 @@ class WorkshopViewModel {
                 guard let self else { return }
                 self.workshopFavoriteIDs = favoriteIDs
                 if self.workshopShowOnly.contains(.myFavourites) {
-                    self.currentPage = 1
-                    self.search()
+                    self.search(page: 1)
                 }
                 if self.subscriptionShowOnly.contains(.myFavourites) {
                     self.refreshSubscriptionFilters()
@@ -645,35 +643,56 @@ class WorkshopViewModel {
 
     // MARK: - Search
 
+    private struct SearchCriteria: Equatable {
+        let text: String
+        let tags: Set<String>
+        let sort: WorkshopSortOrder
+        let types: Set<WorkshopTypeFilter>
+        let showOnly: FRShowOnly
+        let favorites: Set<String>
+        let ageRating: WorkshopAgeRatingFilter
+        let widescreen: FRWidescreenResolution
+        let ultraWidescreen: FRUltraWidescreenResolution
+        let dualscreen: FRDualscreenResolution
+        let triplescreen: FRTriplescreenResolution
+        let portrait: FRPortraitScreenResolution
+        let misc: FRMiscResolution
+        let trendPeriod: WorkshopTrendPeriod
+    }
+
+    private var displayedSearchCriteria: SearchCriteria?
+    private var requestedSearchCriteria: SearchCriteria?
+    private var failedSearch: (criteria: SearchCriteria, page: Int)?
+
+    private var currentSearchCriteria: SearchCriteria {
+        SearchCriteria(text: searchText.trimmingCharacters(in: .whitespacesAndNewlines),
+                       tags: selectedTags, sort: sortOrder, types: selectedTypeFilters.normalizedWorkshopTypes,
+                       showOnly: workshopShowOnly,
+                       favorites: workshopShowOnly.contains(.myFavourites) ? SteamServiceManager.shared.workshopFavoriteIDs : [],
+                       ageRating: ageRatingFilter, widescreen: widescreenResolution,
+                       ultraWidescreen: ultraWidescreenResolution, dualscreen: dualscreenResolution,
+                       triplescreen: triplescreenResolution, portrait: portraitResolution,
+                       misc: miscResolution, trendPeriod: trendPeriod)
+    }
+
+    var isLoadingNewSearch: Bool {
+        isLoading && !items.isEmpty && requestedSearchCriteria != displayedSearchCriteria
+    }
+
     func search(page: Int? = nil) {
         searchTask?.cancel()
         searchGeneration += 1
         let generation = searchGeneration
-        let requestSearchText = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let requestTags = Array(selectedTags)
-        let requestSortOrder = sortOrder
-        let requestTypeFilters = selectedTypeFilters.normalizedWorkshopTypes
-        let requestShowOnly = workshopShowOnly
-        let requestFavoriteIDs = SteamServiceManager.shared.workshopFavoriteIDs
-        let requestAgeRating = ageRatingFilter
-        let requestWidescreenResolution = widescreenResolution
-        let requestUltraWidescreenResolution = ultraWidescreenResolution
-        let requestDualscreenResolution = dualscreenResolution
-        let requestTriplescreenResolution = triplescreenResolution
-        let requestPortraitResolution = portraitResolution
-        let requestMiscResolution = miscResolution
-        let requestTrendPeriod = trendPeriod
-        let requestPage = page ?? currentPage
-        if requestShowOnly.contains(.myFavourites), !SteamServiceManager.shared.isLoggedIn {
-            items = []
-            totalItems = 0
-            isLoading = false
-            requestedPage = nil
-            error = L("需要登录 Steam")
+        let criteria = currentSearchCriteria
+        let requestPage = page ?? (criteria == displayedSearchCriteria ? currentPage : 1)
+        if criteria.showOnly.contains(.myFavourites), !SteamServiceManager.shared.isLoggedIn {
+            finishSearchFailure(L("需要登录 Steam"), criteria: criteria, page: requestPage)
             return
         }
         isLoading = true
         requestedPage = requestPage
+        requestedSearchCriteria = criteria
+        failedSearch = nil
         error = nil
         pageNavigationMessage = nil
         steamServiceStatus.browsingAPI = .checking
@@ -685,48 +704,45 @@ class WorkshopViewModel {
                 var matchedCreator: WorkshopCreator?
                 if let pageSearch = self.pageSearch {
                     result = try await pageSearch(requestPage)
-                } else if Self.isPublishedFileId(requestSearchText) {
-                    let details = try await SteamWebAPI.shared.getFileDetails(workshopIds: [requestSearchText])
+                } else if Self.isPublishedFileId(criteria.text) {
+                    let details = try await SteamWebAPI.shared.getFileDetails(workshopIds: [criteria.text])
                     let items = details.filter {
-                        $0.publishedFileId == requestSearchText &&
+                        $0.publishedFileId == criteria.text &&
                             $0.consumerAppId == 431960 &&
-                            requestShowOnly.matches(
+                            criteria.showOnly.matches(
                                 workshopItem: $0,
-                                favoriteIDs: requestFavoriteIDs
+                                favoriteIDs: criteria.favorites
                             )
                     }
                     result = (items, items.count)
-                } else if Self.isSteamUserId(requestSearchText) {
-                    matchedCreator = await SteamWebAPI.shared.creatorProfile(steamId: requestSearchText)
+                } else if Self.isSteamUserId(criteria.text) {
+                    matchedCreator = await SteamWebAPI.shared.creatorProfile(steamId: criteria.text)
                     result = ([], 0)
                 } else {
                     result = try await SteamWebAPI.shared.queryFiles(
-                        searchText: requestSearchText,
-                        tags: requestTags,
-                        sortOrder: requestSortOrder,
-                        typeFilters: requestTypeFilters,
-                        ageRating: requestAgeRating,
-                        widescreenResolution: requestWidescreenResolution,
-                        ultraWidescreenResolution: requestUltraWidescreenResolution,
-                        dualscreenResolution: requestDualscreenResolution,
-                        triplescreenResolution: requestTriplescreenResolution,
-                        portraitResolution: requestPortraitResolution,
-                        miscResolution: requestMiscResolution,
-                        showOnly: requestShowOnly,
-                        favoriteIDs: requestFavoriteIDs,
+                        searchText: criteria.text,
+                        tags: Array(criteria.tags),
+                        sortOrder: criteria.sort,
+                        typeFilters: criteria.types,
+                        ageRating: criteria.ageRating,
+                        widescreenResolution: criteria.widescreen,
+                        ultraWidescreenResolution: criteria.ultraWidescreen,
+                        dualscreenResolution: criteria.dualscreen,
+                        triplescreenResolution: criteria.triplescreen,
+                        portraitResolution: criteria.portrait,
+                        miscResolution: criteria.misc,
+                        showOnly: criteria.showOnly,
+                        favoriteIDs: criteria.favorites,
                         page: requestPage,
                         perPage: self.itemsPerPage,
-                        trendDays: requestSortOrder.usesTrendPeriod ? requestTrendPeriod.rawValue : nil
+                        trendDays: criteria.sort.usesTrendPeriod ? criteria.trendPeriod.rawValue : nil
                     )
                 }
 
                 guard !Task.isCancelled, generation == self.searchGeneration else { return }
-                if (page != nil || requestPage > 1), result.items.isEmpty, !self.items.isEmpty {
+                if criteria == self.displayedSearchCriteria, (page != nil || requestPage > 1),
+                   result.items.isEmpty, !self.items.isEmpty {
                     let retainedPage = self.loadedPage
-                    if result.total > 0 {
-                        self.totalItems = result.total
-                    }
-                    self.currentPage = retainedPage
                     self.pageNavigationMessage = L(
                         "Steam 没有返回第 %d 页，已保留第 %d 页。",
                         requestPage,
@@ -734,6 +750,8 @@ class WorkshopViewModel {
                     )
                     self.isLoading = false
                     self.requestedPage = nil
+                    self.requestedSearchCriteria = nil
+                    self.failedSearch = (criteria, requestPage)
                     self.steamServiceStatus.browsingAPI = .available(L("Steam Web API 可用"))
                     return
                 }
@@ -741,6 +759,7 @@ class WorkshopViewModel {
                 self.totalItems = result.total
                 self.currentPage = requestPage
                 self.loadedPage = requestPage
+                self.displayedSearchCriteria = criteria
                 self.pageLoadRevision &+= 1
                 self.rememberCreators(in: result.items)
                 self.refreshSubscriptionStates(for: result.items)
@@ -749,16 +768,11 @@ class WorkshopViewModel {
                 }
                 self.isLoading = false
                 self.requestedPage = nil
+                self.requestedSearchCriteria = nil
                 self.steamServiceStatus.browsingAPI = .available(L("Steam Web API 可用"))
             } catch {
                 guard !Task.isCancelled, generation == self.searchGeneration else { return }
-                self.error = error.localizedDescription
-                if page != nil {
-                    self.currentPage = self.loadedPage
-                    self.pageNavigationMessage = error.localizedDescription
-                }
-                self.isLoading = false
-                self.requestedPage = nil
+                self.finishSearchFailure(error.localizedDescription, criteria: criteria, page: requestPage)
                 self.steamServiceStatus.browsingAPI = .unavailable(error.localizedDescription)
             }
         }
@@ -766,6 +780,20 @@ class WorkshopViewModel {
 
     func refreshSearch() {
         search()
+    }
+
+    private func finishSearchFailure(_ message: String, criteria: SearchCriteria, page: Int) {
+        error = message
+        pageNavigationMessage = items.isEmpty ? nil : L("加载失败，仍显示上次结果：%@", message)
+        failedSearch = (criteria, page)
+        isLoading = false
+        requestedPage = nil
+        requestedSearchCriteria = nil
+    }
+
+    func retrySearch() {
+        let page = failedSearch.flatMap { $0.criteria == currentSearchCriteria ? $0.page : nil }
+        search(page: page)
     }
 
     func selectWorkshopSort(
@@ -776,8 +804,7 @@ class WorkshopViewModel {
         if let period {
             trendPeriod = period
         }
-        currentPage = 1
-        search()
+        search(page: 1)
     }
 
     func submitSearch() {
@@ -792,8 +819,7 @@ class WorkshopViewModel {
             openCreatorWorkshop(WorkshopCreator(steamId: query, name: query))
             return
         }
-        currentPage = 1
-        search()
+        search(page: 1)
     }
 
     func openCreatorWorkshop(_ creator: WorkshopCreator) {
@@ -875,8 +901,14 @@ class WorkshopViewModel {
     }
 
     func goToPage(_ page: Int) {
+        let criteria = currentSearchCriteria
+        // A new or failed query must start at page one before reusing the old result's page range.
+        if criteria != displayedSearchCriteria && (!isLoading || criteria != requestedSearchCriteria) {
+            search(page: 1)
+            return
+        }
         let clamped = max(1, min(page, totalPages))
-        guard clamped != requestedPage,
+        guard clamped != requestedPage || criteria != requestedSearchCriteria,
               isLoading || clamped != currentPage else { return }
         search(page: clamped)
     }
@@ -906,8 +938,7 @@ class WorkshopViewModel {
         let updated = Self.updatedTypeSelection(selectedTypeFilters, filter: filter, isOn: isOn)
         guard updated != selectedTypeFilters else { return }
         selectedTypeFilters = updated
-        currentPage = 1
-        search()
+        search(page: 1)
     }
 
     func applyTagFilter(_ tag: String) {
@@ -916,8 +947,7 @@ class WorkshopViewModel {
         } else {
             selectedTags.insert(tag)
         }
-        currentPage = 1
-        search()
+        search(page: 1)
     }
 
     func applyAgeRatingFilter(_ rating: WorkshopAgeRating, isOn: Bool) {
@@ -930,8 +960,7 @@ class WorkshopViewModel {
         }
         guard updated != ageRatingFilter else { return }
         ageRatingFilter = updated
-        currentPage = 1
-        search()
+        search(page: 1)
     }
 
     func setResolutionOption<Filter: FilterResultsModel>(
@@ -946,8 +975,7 @@ class WorkshopViewModel {
             value.remove(option)
         }
         self[keyPath: keyPath] = value
-        currentPage = 1
-        search()
+        search(page: 1)
     }
 
     func selectAllResolutions() {
@@ -957,8 +985,7 @@ class WorkshopViewModel {
         triplescreenResolution = .all
         portraitResolution = .all
         miscResolution = .all
-        currentPage = 1
-        search()
+        search(page: 1)
     }
 
     func clearResolutions() {
@@ -968,8 +995,7 @@ class WorkshopViewModel {
         triplescreenResolution = .none
         portraitResolution = .none
         miscResolution = .none
-        currentPage = 1
-        search()
+        search(page: 1)
     }
 
     var allResolutionsSelected: Bool {
@@ -998,8 +1024,7 @@ class WorkshopViewModel {
         triplescreenResolution = .all
         portraitResolution = .all
         miscResolution = .all
-        currentPage = 1
-        search()
+        search(page: 1)
     }
 
     // MARK: - Discover
@@ -1261,11 +1286,10 @@ class WorkshopViewModel {
         } else {
             workshopShowOnly.remove(option)
         }
-        currentPage = 1
         if workshopShowOnly.contains(.myFavourites) {
             SteamServiceManager.shared.refreshWorkshopFavorites()
         }
-        search()
+        search(page: 1)
     }
 
     private func rememberCreators(in items: [WorkshopItem]) {
@@ -2117,8 +2141,7 @@ class WorkshopViewModel {
         sortOrder = .trending
         self.trendPeriod = trendPeriod
         showCustomization = false
-        currentPage = 1
-        search()
+        search(page: 1)
     }
 
     func navigateToWorkshopWithSort(
@@ -2131,8 +2154,7 @@ class WorkshopViewModel {
         sortOrder = sort
         self.trendPeriod = trendPeriod
         showCustomization = false
-        currentPage = 1
-        search()
+        search(page: 1)
     }
 
     func logout() {
