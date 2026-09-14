@@ -118,6 +118,7 @@ struct WorkshopView: View {
                             currentPage: workshopViewModel.currentPage,
                             pageCount: workshopViewModel.totalPages,
                             isLoading: workshopViewModel.isLoading,
+                            requestedPage: workshopViewModel.requestedPage,
                             onSelect: workshopViewModel.goToPage
                         )
                         .padding(.bottom, 12)
@@ -155,6 +156,7 @@ struct WorkshopView: View {
                             currentPage: workshopViewModel.currentPage,
                             pageCount: workshopViewModel.totalPages,
                             isLoading: workshopViewModel.isLoading,
+                            requestedPage: workshopViewModel.requestedPage,
                             onSelect: workshopViewModel.goToPage
                         )
                         .padding(.bottom, 12)
@@ -222,8 +224,8 @@ struct WorkshopView: View {
                             Color.clear.frame(height: 58)
                         }
                     }
-                    // Reset scrolling when the new page's items arrive, not when its request starts.
-                    .id(workshopViewModel.loadedPage)
+                    // Reset only after accepting new content, including a reload of the same page.
+                    .id(workshopViewModel.pageLoadRevision)
                     .contextMenu {
                         WallpaperGridViewMenu(viewModel: viewModel)
                     }
@@ -233,6 +235,7 @@ struct WorkshopView: View {
                             currentPage: workshopViewModel.currentPage,
                             pageCount: workshopViewModel.totalPages,
                             isLoading: workshopViewModel.isLoading,
+                            requestedPage: workshopViewModel.requestedPage,
                             onSelect: workshopViewModel.goToPage
                         )
                         .padding(.bottom, 12)

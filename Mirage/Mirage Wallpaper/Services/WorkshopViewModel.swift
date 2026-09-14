@@ -272,6 +272,8 @@ class WorkshopViewModel {
     private var commentAuthorTask: Task<Void, Never>?
     private var selectionGeneration = 0
     private(set) var loadedPage = 1
+    private(set) var requestedPage: Int?
+    private(set) var pageLoadRevision: UInt64 = 0
     private let commentsPageSize = 20
     private var subscriptionPageSize: Int {
         let value = UserDefaults.standard.integer(forKey: "WallpapersPerPage")
@@ -666,10 +668,12 @@ class WorkshopViewModel {
             items = []
             totalItems = 0
             isLoading = false
+            requestedPage = nil
             error = L("需要登录 Steam")
             return
         }
         isLoading = true
+        requestedPage = requestPage
         error = nil
         pageNavigationMessage = nil
         steamServiceStatus.browsingAPI = .checking
@@ -729,6 +733,7 @@ class WorkshopViewModel {
                         retainedPage
                     )
                     self.isLoading = false
+                    self.requestedPage = nil
                     self.steamServiceStatus.browsingAPI = .available(L("Steam Web API 可用"))
                     return
                 }
@@ -736,12 +741,14 @@ class WorkshopViewModel {
                 self.totalItems = result.total
                 self.currentPage = requestPage
                 self.loadedPage = requestPage
+                self.pageLoadRevision &+= 1
                 self.rememberCreators(in: result.items)
                 self.refreshSubscriptionStates(for: result.items)
                 if let matchedCreator {
                     self.rememberCreator(matchedCreator)
                 }
                 self.isLoading = false
+                self.requestedPage = nil
                 self.steamServiceStatus.browsingAPI = .available(L("Steam Web API 可用"))
             } catch {
                 guard !Task.isCancelled, generation == self.searchGeneration else { return }
@@ -751,6 +758,7 @@ class WorkshopViewModel {
                     self.pageNavigationMessage = error.localizedDescription
                 }
                 self.isLoading = false
+                self.requestedPage = nil
                 self.steamServiceStatus.browsingAPI = .unavailable(error.localizedDescription)
             }
         }
@@ -859,17 +867,17 @@ class WorkshopViewModel {
     }
 
     func loadNextPage() {
-        goToPage(currentPage + 1)
+        goToPage((requestedPage ?? currentPage) + 1)
     }
 
     func loadPreviousPage() {
-        goToPage(currentPage - 1)
+        goToPage((requestedPage ?? currentPage) - 1)
     }
 
     func goToPage(_ page: Int) {
-        guard !isLoading else { return }
         let clamped = max(1, min(page, totalPages))
-        guard clamped != currentPage else { return }
+        guard clamped != requestedPage,
+              isLoading || clamped != currentPage else { return }
         search(page: clamped)
     }
 

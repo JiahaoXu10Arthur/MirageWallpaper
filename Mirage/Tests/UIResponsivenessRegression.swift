@@ -684,6 +684,7 @@ private struct UIResponsivenessRegression {
             var replies: [CheckedContinuation<Result, Error>] = []
             func load(_ page: Int) async throws -> Result {
                 pages.append(page)
+                // Deliberately ignore cancellation so stale responses exercise the production guard.
                 return try await withCheckedThrowingContinuation { replies.append($0) }
             }
         }
@@ -695,72 +696,102 @@ private struct UIResponsivenessRegression {
         let probe = SearchProbe()
         let model = WorkshopViewModel(subscriptionCatalog: [], pageSearch: probe.load)
         let total = model.itemsPerPage * 3
+        let failure = NSError(domain: "PaginationRegression", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "Page request failed"])
         model.search()
         try await waitUntil("initial page request") { probe.replies.count == 1 }
         probe.replies[0].resume(returning: ([first], total))
         try await waitUntil("initial page result") { !model.isLoading }
-        try require(model.currentPage == 1 && model.loadedPage == 1, "Initial page was not committed")
+        let firstRevision = model.pageLoadRevision
+        try require(model.currentPage == 1 && model.loadedPage == 1 && model.requestedPage == nil,
+                    "Initial page was not committed")
 
         model.goToPage(2)
-        model.goToPage(1)
-        model.goToPage(3)
-        model.loadNextPage()
-        model.loadPreviousPage()
         try await waitUntil("second page request") { probe.replies.count == 2 }
-        try require(probe.pages == [1, 2] && model.isLoading && model.currentPage == 1 &&
-                    model.loadedPage == 1 && model.items.map(\.id) == [first.id],
-                    "Rapid navigation replaced the pending request or changed the visible page before success")
+        model.goToPage(2)
+        model.goToPage(1)
+        try await waitUntil("return-to-first-page request") { probe.replies.count == 3 }
+        try require(probe.pages == [1, 2, 1] && model.isLoading && model.requestedPage == 1 &&
+                    model.currentPage == 1 && model.items.map(\.id) == [first.id] &&
+                    model.pageLoadRevision == firstRevision,
+                    "Rapid 1→2→1 was blocked, duplicated the same target or changed visible content early")
         probe.replies[1].resume(returning: ([second], total))
-        try await waitUntil("second page result") { !model.isLoading }
-        try require(model.currentPage == 2 && model.loadedPage == 2 && model.items.map(\.id) == [second.id],
-                    "Successful navigation did not commit page, content and scroll identity together")
+        try await Task.sleep(for: .milliseconds(30))
+        try require(model.isLoading && model.requestedPage == 1 && model.currentPage == 1 &&
+                    model.pageLoadRevision == firstRevision, "A stale success applied or ended the latest loading state")
+        probe.replies[2].resume(returning: ([first], total))
+        try await waitUntil("same-page reload completion") { !model.isLoading }
+        try require(model.currentPage == 1 && model.requestedPage == nil &&
+                    model.pageLoadRevision == firstRevision + 1,
+                    "Reloading the same page did not change its scroll identity")
+
+        model.goToPage(2)
+        try await waitUntil("next pending request") { probe.replies.count == 4 }
+        model.loadNextPage()
+        try await waitUntil("next relative to pending target") { probe.replies.count == 5 }
+        model.loadPreviousPage()
+        try await waitUntil("previous relative to pending target") { probe.replies.count == 6 }
+        try require(probe.pages.suffix(3) == [2, 3, 2] && model.requestedPage == 2 && model.currentPage == 1,
+                    "Arrow navigation did not follow the pending target")
+        probe.replies[4].resume(throwing: failure)
+        try await Task.sleep(for: .milliseconds(30))
+        try require(model.isLoading && model.requestedPage == 2 && model.pageNavigationMessage == nil,
+                    "A stale failure ended or reported an error for the latest request")
+        probe.replies[5].resume(returning: ([second], total))
+        try await waitUntil("latest second-page success") { !model.isLoading }
+        let secondRevision = model.pageLoadRevision
+        probe.replies[3].resume(returning: ([first], total))
+        try await Task.sleep(for: .milliseconds(30))
+        try require(model.currentPage == 2 && model.loadedPage == 2 && model.items.map(\.id) == [second.id] &&
+                    model.pageLoadRevision == secondRevision && model.requestedPage == nil,
+                    "An older response arriving after completion overwrote the accepted result")
 
         model.goToPage(1)
-        try await waitUntil("failed navigation request") { probe.replies.count == 3 }
-        let failure = NSError(domain: "PaginationRegression", code: 1,
-                              userInfo: [NSLocalizedDescriptionKey: "Page request failed"])
-        probe.replies[2].resume(throwing: failure)
+        try await waitUntil("failed navigation request") { probe.replies.count == 7 }
+        probe.replies[6].resume(throwing: failure)
         try await waitUntil("failed navigation cleanup") { !model.isLoading }
         try require(model.currentPage == 2 && model.loadedPage == 2 && model.items.map(\.id) == [second.id] &&
+                    model.pageLoadRevision == secondRevision && model.requestedPage == nil &&
                     model.pageNavigationMessage == failure.localizedDescription,
-                    "Failed navigation discarded the old page or did not expose a visible error")
+                    "Failed navigation did not retain content/scroll identity or clear the pending target")
         model.goToPage(1)
-        try await waitUntil("retry request") { probe.replies.count == 4 }
-        probe.replies[3].resume(returning: ([first], total))
+        try await waitUntil("retry request") { probe.replies.count == 8 }
+        probe.replies[7].resume(returning: ([first], total))
         try await waitUntil("retry completion") { !model.isLoading }
-        try require(model.currentPage == 1 && model.loadedPage == 1 && model.pageNavigationMessage == nil,
-                    "Navigation could not recover after failure")
+        try require(model.currentPage == 1 && model.pageNavigationMessage == nil &&
+                    model.pageLoadRevision == secondRevision + 1, "Navigation did not recover after failure")
 
+        let retainedRevision = model.pageLoadRevision
         model.goToPage(2)
-        try await waitUntil("empty page request") { probe.replies.count == 5 }
-        probe.replies[4].resume(returning: ([], total))
+        try await waitUntil("empty page request") { probe.replies.count == 9 }
+        probe.replies[8].resume(returning: ([], total))
         try await waitUntil("empty page cleanup") { !model.isLoading }
-        try require(model.currentPage == 1 && model.loadedPage == 1 && model.items.map(\.id) == [first.id] &&
-                    model.pageNavigationMessage != nil, "An empty response discarded the current page")
+        try require(model.currentPage == 1 && model.items.map(\.id) == [first.id] && model.requestedPage == nil &&
+                    model.pageLoadRevision == retainedRevision && model.pageNavigationMessage != nil,
+                    "An empty response discarded current content or reset scrolling")
         model.loadNextPage()
-        try await waitUntil("next-page recovery") { probe.replies.count == 6 }
-        probe.replies[5].resume(returning: ([second], total))
+        try await waitUntil("next-page recovery") { probe.replies.count == 10 }
+        probe.replies[9].resume(returning: ([second], total))
         try await waitUntil("next-page recovery result") { !model.isLoading }
         model.loadPreviousPage()
-        try await waitUntil("empty first-page request") { probe.replies.count == 7 }
-        probe.replies[6].resume(returning: ([], total))
+        try await waitUntil("empty first-page request") { probe.replies.count == 11 }
+        probe.replies[10].resume(returning: ([], total))
         try await waitUntil("empty first-page cleanup") { !model.isLoading }
-        try require(model.currentPage == 2 && model.loadedPage == 2 && model.items.map(\.id) == [second.id],
+        try require(model.currentPage == 2 && model.items.map(\.id) == [second.id] && model.requestedPage == nil,
                     "An empty response when returning to page one discarded the current page")
 
-        // Search/filter changes can still supersede pagination; late callbacks must not unlock it.
         model.goToPage(3)
-        try await waitUntil("superseded page request") { probe.replies.count == 8 }
+        try await waitUntil("superseded page request") { probe.replies.count == 12 }
         model.refreshSearch()
-        try await waitUntil("replacement search") { probe.replies.count == 9 }
-        probe.replies[7].resume(throwing: failure)
+        try await waitUntil("replacement search") { probe.replies.count == 13 }
+        probe.replies[11].resume(throwing: failure)
         try await Task.sleep(for: .milliseconds(30))
-        try require(model.isLoading && model.currentPage == 2 && model.loadedPage == 2 &&
-                    model.pageNavigationMessage == nil, "A stale failure unlocked or rolled back the replacement search")
-        probe.replies[8].resume(returning: ([second], total))
+        try require(model.isLoading && model.requestedPage == 2 && model.currentPage == 2 &&
+                    model.pageNavigationMessage == nil, "A stale failure rolled back the replacement search")
+        probe.replies[12].resume(returning: ([second], total))
         try await waitUntil("replacement completion") { !model.isLoading }
-        try require(probe.pages == [1, 2, 1, 1, 2, 2, 1, 3, 2], "Unexpected requests escaped the pagination lock")
-        print("PASS: pagination lock, committed page identity, failure/empty rollback, retry and stale completion handling")
+        try require(probe.pages == [1, 2, 1, 2, 3, 2, 1, 1, 2, 2, 1, 3, 2], "Unexpected pagination requests")
+        print("PASS: latest-target navigation, same-page scroll reset, stale success/failure rejection, retained-page errors and retry")
     }
 
     static func testObservation() throws {

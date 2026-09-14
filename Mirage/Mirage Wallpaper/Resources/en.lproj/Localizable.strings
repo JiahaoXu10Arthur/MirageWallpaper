@@ -990,3 +990,5 @@
 "上一张" = "Previous Wallpaper";
 "下一张" = "Next Wallpaper";
 "正在应用壁纸…" = "Applying wallpaper…";
+
+"正在加载第 %d 页…" = "Loading page %d…";
