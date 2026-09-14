@@ -9,6 +9,16 @@ import Observation
 import Combine
 import AppKit
 
+// Completions are delivered on the main thread, like SteamServiceManager's API.
+protocol WorkshopSubscriptionService: AnyObject {
+    var isLoggedIn: Bool { get }
+    func fetchSubscriptionStates(workshopIds: [String], completion: @escaping (Result<[String: Bool], Error>) -> Void)
+    func subscribe(workshopId: String, completion: @escaping (Result<Void, Error>) -> Void)
+    func unsubscribe(workshopId: String, completion: @escaping (Result<Void, Error>) -> Void)
+}
+
+extension SteamServiceManager: WorkshopSubscriptionService {}
+
 @Observable
 class WorkshopViewModel {
     struct SubscriptionDownloadPlan {
@@ -151,6 +161,7 @@ class WorkshopViewModel {
     private(set) var checkingSubscriptionIDs: Set<String> = []
     private(set) var changingSubscriptionIDs: Set<String> = []
     private var subscriptionStateRequests: [String: UUID] = [:]
+    @ObservationIgnored private let subscriptionService: any WorkshopSubscriptionService
     private(set) var subscriptionActionError: String?
     private(set) var subscriptionActionErrorItemID: String?
     private(set) var workshopFavoriteIDs: Set<String> = []
@@ -327,7 +338,9 @@ class WorkshopViewModel {
             input.items.filter(input.filter.matches)
         }
 
-    init(subscriptionCatalog: [WorkshopItem]? = nil) {
+    init(subscriptionCatalog: [WorkshopItem]? = nil,
+         subscriptionService: any WorkshopSubscriptionService = SteamServiceManager.shared) {
+        self.subscriptionService = subscriptionService
         if let subscriptionCatalog {
             subscriptionCatalogItems = subscriptionCatalog
             rebuildSubscriptionPage(startIndex: 0)
@@ -1599,7 +1612,7 @@ class WorkshopViewModel {
     }
 
     func refreshSubscriptionStates(for items: [WorkshopItem]) {
-        guard SteamServiceManager.shared.isLoggedIn else { return }
+        guard subscriptionService.isLoggedIn else { return }
         let ids = Set(items.map(\.publishedFileId)).filter {
             !$0.isEmpty && !checkingSubscriptionIDs.contains($0) && !changingSubscriptionIDs.contains($0)
         }
@@ -1611,7 +1624,7 @@ class WorkshopViewModel {
         checkingSubscriptionIDs.formUnion(ids)
         let requestID = UUID()
         for id in ids { subscriptionStateRequests[id] = requestID }
-        SteamServiceManager.shared.fetchSubscriptionStates(workshopIds: Array(ids)) { [weak self] result in
+        subscriptionService.fetchSubscriptionStates(workshopIds: Array(ids)) { [weak self] result in
             guard let self else { return }
             // A subscribe/unsubscribe action supersedes an older read of the state.
             let currentIDs = ids.filter { self.subscriptionStateRequests[$0] == requestID }
@@ -1647,7 +1660,7 @@ class WorkshopViewModel {
         changingSubscriptionIDs.insert(id)
         subscriptionActionError = nil
         subscriptionActionErrorItemID = id
-        SteamServiceManager.shared.subscribe(workshopId: id) { [weak self] result in
+        subscriptionService.subscribe(workshopId: id) { [weak self] result in
             guard let self else { return }
             self.changingSubscriptionIDs.remove(id)
             switch result {
@@ -1677,7 +1690,7 @@ class WorkshopViewModel {
         changingSubscriptionIDs.insert(id)
         subscriptionActionError = nil
         subscriptionActionErrorItemID = id
-        SteamServiceManager.shared.unsubscribe(workshopId: id) { [weak self] result in
+        subscriptionService.unsubscribe(workshopId: id) { [weak self] result in
             guard let self else { return }
             self.changingSubscriptionIDs.remove(id)
             switch result {
@@ -1688,8 +1701,7 @@ class WorkshopViewModel {
                 self.subscriptionCatalogItems.removeAll { $0.publishedFileId == id }
                 self.rebuildSubscriptionPage(startIndex: self.subscriptionStartIndex)
                 do {
-                    try WallpaperLibrary.shared.removeManagedWorkshopItem(workshopId: id)
-                    self.refreshInstalledState(reconcileDownloads: true)
+                    try self.removeUnsubscribedWallpaper(workshopId: id)
                 } catch {
                     self.subscriptionActionError = L("已取消订阅，但无法删除 Mirage 下载副本：%@", error.localizedDescription)
                     self.subscriptionActionErrorItemID = id
@@ -1699,6 +1711,11 @@ class WorkshopViewModel {
                 self.subscriptionActionErrorItemID = id
             }
         }
+    }
+
+    func removeUnsubscribedWallpaper(workshopId: String) throws {
+        try WallpaperLibrary.shared.removeManagedWorkshopItem(workshopId: workshopId)
+        refreshInstalledState(reconcileDownloads: true)
     }
 
     func prepareWorkshopInteractions(for item: WorkshopItem) {
@@ -2003,8 +2020,8 @@ class WorkshopViewModel {
               !changingSubscriptionIDs.contains(id) else { return }
         if let state = downloadState(for: id) {
             switch state {
-            case .queued, .resolving, .downloading, .validating: return
-            case .failed, .completed: break
+            case .queued, .resolving, .downloading, .validating, .completed: return
+            case .failed: break
             }
         }
         subscribe(item)
