@@ -150,6 +150,7 @@ class WorkshopViewModel {
     private(set) var subscriptionStates: [String: WorkshopSubscriptionState] = [:]
     private(set) var checkingSubscriptionIDs: Set<String> = []
     private(set) var changingSubscriptionIDs: Set<String> = []
+    private var subscriptionStateRequests: [String: UUID] = [:]
     private(set) var subscriptionActionError: String?
     private(set) var subscriptionActionErrorItemID: String?
     private(set) var workshopFavoriteIDs: Set<String> = []
@@ -1608,19 +1609,25 @@ class WorkshopViewModel {
             subscriptionActionErrorItemID = selectedID
         }
         checkingSubscriptionIDs.formUnion(ids)
+        let requestID = UUID()
+        for id in ids { subscriptionStateRequests[id] = requestID }
         SteamServiceManager.shared.fetchSubscriptionStates(workshopIds: Array(ids)) { [weak self] result in
             guard let self else { return }
-            self.checkingSubscriptionIDs.subtract(ids)
+            // A subscribe/unsubscribe action supersedes an older read of the state.
+            let currentIDs = ids.filter { self.subscriptionStateRequests[$0] == requestID }
+            guard !currentIDs.isEmpty else { return }
+            for id in currentIDs { self.subscriptionStateRequests.removeValue(forKey: id) }
+            self.checkingSubscriptionIDs.subtract(currentIDs)
             switch result {
             case .success(let states):
-                for id in ids {
+                for id in currentIDs {
                     self.subscriptionStates[id] = states[id] == true ? .subscribed : .unsubscribed
                 }
-                if let errorID = self.subscriptionActionErrorItemID, ids.contains(errorID) {
+                if let errorID = self.subscriptionActionErrorItemID, currentIDs.contains(errorID) {
                     self.subscriptionActionError = nil
                 }
             case .failure(let error):
-                if ids.contains(self.selectedItem?.publishedFileId ?? "") {
+                if currentIDs.contains(self.selectedItem?.publishedFileId ?? "") {
                     self.subscriptionActionError = error.localizedDescription
                     self.subscriptionActionErrorItemID = self.selectedItem?.publishedFileId
                 }
@@ -1635,6 +1642,8 @@ class WorkshopViewModel {
         }
         let id = item.publishedFileId
         guard !changingSubscriptionIDs.contains(id) else { return }
+        subscriptionStateRequests.removeValue(forKey: id)
+        checkingSubscriptionIDs.remove(id)
         changingSubscriptionIDs.insert(id)
         subscriptionActionError = nil
         subscriptionActionErrorItemID = id
@@ -1663,6 +1672,8 @@ class WorkshopViewModel {
             if steamSetupState != .ready { openSteamSetupIfActionable() }
             return
         }
+        subscriptionStateRequests.removeValue(forKey: id)
+        checkingSubscriptionIDs.remove(id)
         changingSubscriptionIDs.insert(id)
         subscriptionActionError = nil
         subscriptionActionErrorItemID = id
@@ -1985,6 +1996,20 @@ class WorkshopViewModel {
         downloadTask(for: workshopId)?.state
     }
 
+    func activateWorkshopItem(_ item: WorkshopItem) {
+        selectWorkshopItem(item)
+        let id = item.publishedFileId
+        guard !isInstalled(id),
+              !changingSubscriptionIDs.contains(id) else { return }
+        if let state = downloadState(for: id) {
+            switch state {
+            case .queued, .resolving, .downloading, .validating: return
+            case .failed, .completed: break
+            }
+        }
+        subscribe(item)
+    }
+
     func selectWorkshopItem(_ item: WorkshopItem) {
         selectionGeneration += 1
         let generation = selectionGeneration
@@ -2148,6 +2173,7 @@ class WorkshopViewModel {
                 self.subscriptionMiscResolution = .all
                 self.subscriptionStates = [:]
                 self.checkingSubscriptionIDs = []
+                self.subscriptionStateRequests = [:]
                 self.changingSubscriptionIDs = []
                 self.subscriptionActionError = nil
                 self.subscriptionActionErrorItemID = nil

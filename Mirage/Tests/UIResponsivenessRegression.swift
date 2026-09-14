@@ -134,6 +134,11 @@ private struct UIResponsivenessRegression {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             NSApplication.shared.setActivationPolicy(.accessory)
             NSApplication.shared.finishLaunching()
+            if CommandLine.arguments.contains("--workshop-activation") {
+                try testWorkshopActivation()
+                print("WorkshopActivationRegression: all checks passed")
+                return
+            }
             if CommandLine.arguments.contains("--playback-policy") {
                 try testPlaybackPolicyEvaluation()
                 try testPlaybackPolicyInputs()
@@ -159,6 +164,7 @@ private struct UIResponsivenessRegression {
             try await testInteractiveUpdates()
             try await testWallpaperSizes()
             try await testSubscriptionFiltering()
+            try testWorkshopActivation()
             try await testConditions()
             try testObservation()
             try await testImages()
@@ -669,6 +675,48 @@ private struct UIResponsivenessRegression {
         try require(result.isEmpty && Date().timeIntervalSince(blockedStart) < 2,
                     "A worker that never reads stdin blocked its timeout")
         print("PASS: condition values, exceptions, timeout, main-loop heartbeat and cancellation recovery")
+    }
+
+    static func testWorkshopActivation() throws {
+        // Exercise the actual activation handler without touching a Steam account.
+        final class Probe: WorkshopViewModel {
+            var selections: [String] = []
+            var subscriptions: [String] = []
+            var installed = false
+
+            override func selectWorkshopItem(_ item: WorkshopItem) {
+                selections.append(item.publishedFileId)
+            }
+            override func subscribe(_ item: WorkshopItem) {
+                subscriptions.append(item.publishedFileId)
+                downloadQueue.append(DownloadTask(workshopItem: item, attemptID: nil,
+                    state: .queued, startedAt: nil, completedAt: nil, purpose: .subscription))
+            }
+            override func isInstalled(_ workshopId: String) -> Bool { installed }
+        }
+        let item = WorkshopItem(publishedFileId: "1", title: "Activation regression", itemDescription: "",
+            previewImageURL: nil, tags: [], subscriptions: 0, favorited: 0, views: 0, fileSize: 1,
+            timeCreated: Date(), timeUpdated: Date(), creatorSteamId: "", wallpaperType: "video")
+        let model = Probe(subscriptionCatalog: [])
+        model.activateWorkshopItem(item)
+        try require(model.selections == [item.publishedFileId] && model.subscriptions == [item.publishedFileId],
+                    "Double-click selected an uninstalled wallpaper without subscribing and queuing it")
+        for state in [DownloadState.queued, .resolving, .validating,
+                      .downloading(.init(receivedBytes: 1, totalBytes: 10, bytesPerSecond: 1, etaSeconds: nil))] {
+            model.downloadQueue[0].state = state
+            model.activateWorkshopItem(item)
+        }
+        try require(model.subscriptions.count == 1, "Repeated activation duplicated an active download")
+        model.downloadQueue[0].state = .failed("Test failure")
+        model.activateWorkshopItem(item)
+        try require(model.subscriptions.count == 2, "A failed download could not be retried by double-clicking")
+        model.downloadQueue.removeAll()
+        model.installed = true
+        let selectionsBefore = model.selections.count
+        model.activateWorkshopItem(item)
+        try require(model.selections.count == selectionsBefore + 1 && model.subscriptions.count == 2,
+                    "An installed wallpaper was downloaded again instead of being opened")
+        print("PASS: workshop double-click activation, active download deduplication, retry and installed wallpaper routing")
     }
 
     static func testObservation() throws {
