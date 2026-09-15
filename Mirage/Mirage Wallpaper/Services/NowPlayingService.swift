@@ -26,6 +26,7 @@ final class NowPlayingService {
     private var lastArtworkURL = ""
     private var previousArtworkURL = ""
     private var lastMediaIdentity = ""
+    private var artworkCache = NowPlayingArtworkCache()
 
     private init() {}
 
@@ -46,6 +47,7 @@ final class NowPlayingService {
                 lastArtworkURL = ""
                 previousArtworkURL = ""
                 lastMediaIdentity = ""
+                artworkCache.clear()
             }
         }
     }
@@ -78,7 +80,7 @@ final class NowPlayingService {
         ]
         if let encoded = object["artworkData"] as? String,
            let artwork = Data(base64Encoded: encoded), !artwork.isEmpty,
-           let image = persistArtwork(artwork, mimeType: object["artworkMimeType"] as? String) {
+           let image = artworkCache.persistArtwork(artwork, mimeType: object["artworkMimeType"] as? String) {
             if image.url != lastArtworkURL {
                 if !lastArtworkURL.isEmpty {
                     previousArtworkURL = lastArtworkURL
@@ -142,6 +144,7 @@ final class NowPlayingService {
         lastArtworkURL = ""
         previousArtworkURL = ""
         lastMediaIdentity = ""
+        artworkCache.clear()
         onUpdate?([
             "state": 0,
             "title": "",
@@ -164,14 +167,36 @@ final class NowPlayingService {
             .joined(separator: "\u{1f}")
     }
 
-    private func persistArtwork(_ data: Data, mimeType: String?)
+}
+
+// Retain only the last successful result, never the encoded or decoded image.
+// Polling still publishes position/state updates even when artwork is unchanged.
+struct NowPlayingArtworkCache {
+    private var lastResult: (url: String, colors: [[Double]])?
+    private let directory: URL
+    private let makePalette: (CGImage) -> [[Double]]
+
+    init(directory: URL = FileManager.default.urls(
+        for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Mirage/NowPlaying", isDirectory: true),
+         makePalette: @escaping (CGImage) -> [[Double]] = Self.palette) {
+        self.directory = directory
+        self.makePalette = makePalette
+    }
+
+    mutating func clear() {
+        lastResult = nil
+    }
+
+    mutating func persistArtwork(_ data: Data, mimeType: String?)
         -> (url: String, colors: [[Double]])? {
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         let ext = mimeType?.lowercased().contains("png") == true ? "png" : "jpg"
-        let directory = FileManager.default.urls(
-            for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Mirage/NowPlaying", isDirectory: true)
         let url = directory.appendingPathComponent("\(digest).\(ext)")
+        if let lastResult, lastResult.url == url.path,
+           FileManager.default.fileExists(atPath: url.path) {
+            return lastResult
+        }
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             if !FileManager.default.fileExists(atPath: url.path) {
@@ -186,10 +211,12 @@ final class NowPlayingService {
                 kCGImageSourceThumbnailMaxPixelSize: 48,
                 kCGImageSourceCreateThumbnailWithTransform: true
               ] as CFDictionary) else { return nil }
-        return (url.path, palette(image))
+        let result = (url: url.path, colors: makePalette(image))
+        lastResult = result
+        return result
     }
 
-    private func palette(_ image: CGImage) -> [[Double]] {
+    static func palette(_ image: CGImage) -> [[Double]] {
         let side = 32
         var pixels = [UInt8](repeating: 0, count: side * side * 4)
         guard let space = CGColorSpace(name: CGColorSpace.sRGB),
@@ -233,11 +260,11 @@ final class NowPlayingService {
         return selected + [text, contrast]
     }
 
-    private func distance(_ lhs: [Double], _ rhs: [Double]) -> Double {
+    private static func distance(_ lhs: [Double], _ rhs: [Double]) -> Double {
         sqrt(zip(lhs, rhs).reduce(0) { $0 + pow($1.0 - $1.1, 2) })
     }
 
-    private func fallbackPalette() -> [[Double]] {
+    private static func fallbackPalette() -> [[Double]] {
         [[1, 1, 1], [0.3, 0.3, 0.3], [0.6, 0.6, 0.6], [0, 0, 0], [1, 1, 1]]
     }
 }
