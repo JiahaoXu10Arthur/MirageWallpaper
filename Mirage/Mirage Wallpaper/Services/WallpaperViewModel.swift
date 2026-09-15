@@ -53,6 +53,8 @@ struct ManualDisplayStopState {
         let previous: DisplayKey
         let current: DisplayKey
         let displayID: CGDirectDisplayID
+        let stateKey: DisplayKey?
+        var preservesIdentity: Bool { stateKey == current }
     }
 
     @discardableResult
@@ -71,9 +73,19 @@ struct ManualDisplayStopState {
             return sameConnection(id, new)
         }
         let changes = next.compactMap { info -> KeyChange? in
-            guard let old = previous[info.displayID], old != info.key,
-                  sameConnection(info.displayID, info.key) else { return nil }
-            return KeyChange(previous: old, current: info.key, displayID: info.displayID)
+            guard let old = previous[info.displayID], old != info.key else { return nil }
+            // A reused ID still requires old renderer/request cleanup, but must
+            // not transfer the previous display's wallpaper to its replacement.
+            let stateKey: DisplayKey?
+            if sameConnection(info.displayID, info.key) {
+                stateKey = info.key
+            } else {
+                // The old UUID may still be connected under a different ID.
+                // Retain its own assignment without transferring it by ID.
+                stateKey = Self.canPersist(old, connected: next) && next.contains { $0.key == old } ? old : nil
+            }
+            return KeyChange(previous: old, current: info.key, displayID: info.displayID,
+                             stateKey: stateKey)
         }
         // A UUID collision invalidates the whole group, including its first,
         // unsuffixed member. Preserve only known continuous session bindings.
@@ -1077,16 +1089,16 @@ class WallpaperViewModel: PlaylistPlayback {
                 clear(change.previous, displayID: change.displayID)
             }
             let clearedKeys = Set(keyChanges.map(\.previous))
-            for change in keyChanges where !clearedKeys.contains(change.current) {
+            for change in keyChanges where change.preservesIdentity && !clearedKeys.contains(change.current) {
                 // A vacated destination may still hold a disconnected display's
                 // state, even when there is no source state to move into it.
                 clear(change.current, displayID: change.displayID)
             }
-            for change in keyChanges where !manuallyStoppedDisplays.contains(change.current) {
-                if let state = previousStates[change.previous] {
-                    displayStates[change.current] = state
-                    committedAssignmentIDs[change.current] = UUID()
-                }
+            for change in keyChanges {
+                guard let key = change.stateKey, !manuallyStoppedDisplays.contains(key),
+                      let state = previousStates[change.previous] else { continue }
+                displayStates[key] = state
+                committedAssignmentIDs[key] = UUID()
             }
             persistStates()
         }

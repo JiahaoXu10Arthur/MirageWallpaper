@@ -246,8 +246,10 @@ private struct UIResponsivenessRegression {
 
         var replaced = ManualDisplayStopState(connected: [info(a, 10)])
         replaced.stop(a)
-        replaced.reconcile([info(b, 10)])
-        try require(!replaced.keys.contains(b), "Reused ID stopped a different known UUID")
+        let replacement = replaced.reconcile([info(b, 10)])
+        try require(!replaced.keys.contains(b) && replacement.count == 1 &&
+                    replacement.first?.preservesIdentity == false,
+                    "Reused ID stopped a different UUID or omitted its cleanup")
         var temporaryKey = ManualDisplayStopState(connected: [info(a, 10)])
         temporaryKey.stop(a)
         temporaryKey.reconcile([info(idx0, 10)])
@@ -258,8 +260,9 @@ private struct UIResponsivenessRegression {
         temporaryKey.stop(a)
         temporaryKey.reconcile([info(idx0, 10)])
         let replacedKeys = temporaryKey.reconcile([info(b, 10)])
-        try require(!temporaryKey.keys.contains(b) && replacedKeys.isEmpty,
-                    "Temporary key lost known identity and stopped a replacement UUID")
+        try require(!temporaryKey.keys.contains(b) && replacedKeys.count == 1 &&
+                    replacedKeys.first?.preservesIdentity == false,
+                    "Temporary key lost known identity or omitted replacement cleanup")
         let legacy = ManualDisplayStopState(saved: [idx0.rawValue, "vms:1:2:0:0",
                                                    "uuid:invalid", duplicate.rawValue, a.rawValue],
                                            connected: [info(a, 10)])
@@ -377,6 +380,74 @@ private struct UIResponsivenessRegression {
         print("PASS: topology rekey cancels a real in-flight renderer activation")
     }
 
+    static func testDisplayIDReuse(_ display: DisplayInfo, _ wallpaper: WEWallpaper, _ second: WEWallpaper) async throws {
+        let oldKey = DisplayKey(rawValue: "uuid:44444444-4444-4444-4444-444444444444")
+        let newKey = DisplayKey(rawValue: "uuid:55555555-5555-5555-5555-555555555555")
+        func info(_ key: DisplayKey, _ id: CGDirectDisplayID) -> DisplayInfo {
+            DisplayInfo(key: key, displayID: id, index: 0, name: "Reused ID",
+                        size: display.size, isMain: true)
+        }
+        let old = info(oldKey, 9405)
+        let model = WallpaperViewModel(initialStates: [oldKey:
+            DisplayWallpaperState(wallpaper: wallpaper, runtime: .init())], connectedDisplays: [old])
+        defer { model.renderer.stopAllAndWait() }
+        model.reconcileDisplays([old])
+        try await waitUntil("old display renderer active before ID reuse") {
+            model.renderer.isRendering(onDisplay: old.displayID)
+        }
+        model.reconcileDisplays([info(newKey, old.displayID)])
+        try await waitUntil("reused display ID stops the old renderer") {
+            !model.renderer.hasCoverageOrWork(onDisplay: old.displayID)
+        }
+        try require(model.state(for: oldKey) == nil && model.state(for: newKey) == nil,
+                    "Reused display ID retained or transferred the old wallpaper state")
+
+        // UUID identities can survive a change of display IDs. Cancelling the
+        // old IDs must preserve each still-connected UUID's own assignment.
+        for movedID: CGDirectDisplayID in [9406, 9407] {
+            let swapping = WallpaperViewModel(initialStates: [
+                oldKey: DisplayWallpaperState(wallpaper: wallpaper, runtime: .init()),
+                newKey: DisplayWallpaperState(wallpaper: second, runtime: .init())
+            ], connectedDisplays: [info(oldKey, 9405), info(newKey, 9406)])
+            defer { swapping.renderer.stopAllAndWait() }
+            swapping.reconcileDisplays([info(newKey, 9405), info(oldKey, movedID)])
+            try require(swapping.state(for: oldKey)?.wallpaper.id == wallpaper.id &&
+                        swapping.state(for: newKey)?.wallpaper.id == second.id,
+                        "UUID displays changing IDs lost or exchanged their wallpaper states")
+            try await waitUntil("UUID assignments render on their new IDs") {
+                swapping.renderer.currentWallpaper(onDisplay: movedID)?.id == wallpaper.id &&
+                swapping.renderer.currentWallpaper(onDisplay: 9405)?.id == second.id
+            }
+        }
+
+        // Assign through the real registry key, retaining a known UUID even on
+        // hosts that expose only a positional key. Hold activation in the child.
+        let knownKey = display.key.rawValue.hasPrefix("uuid:") ? display.key : oldKey
+        let pending = WallpaperViewModel(initialStates: [:],
+            connectedDisplays: [info(knownKey, display.displayID)])
+        defer { pending.renderer.stopAllAndWait() }
+        pending.reconcileDisplays([display])
+        let held = try self.wallpaper("held-activate-reused-id-\(UUID().uuidString)")
+        let entry = held.renderDirectory.path
+        var result: Bool?
+        pending.assign(held, to: display.key) { result = $0 }
+        try await waitUntil("reused-ID renderer received activate") {
+            FileManager.default.fileExists(atPath: entry + ".activating")
+        }
+        pending.reconcileDisplays([info(newKey, display.displayID)])
+        try Data().write(to: URL(fileURLWithPath: entry + ".release"))
+        try await waitUntil("reused-ID renderer emitted late activation") {
+            FileManager.default.fileExists(atPath: entry + ".activated")
+        }
+        try await waitUntil("reused-ID assignment rejected and renderer stopped") {
+            result != nil && !pending.renderer.hasCoverageOrWork(onDisplay: display.displayID)
+        }
+        try require(result == false && pending.state(for: display.key) == nil &&
+                    pending.state(for: newKey) == nil && !pending.manuallyStoppedDisplays.contains(newKey),
+                    "Late activation survived a replacement display reusing the ID")
+        print("PASS: display ID reuse cancels active rendering and real in-flight activation")
+    }
+
     static func testStoppedDisplays() async throws {
         try testManualStopIdentity()
         guard let display = DisplayRegistry.shared.connected.first else {
@@ -394,6 +465,7 @@ private struct UIResponsivenessRegression {
         defer { defaults.removePersistentDomain(forName: suite) }
         let first = try wallpaper("stopped-first")
         let second = try wallpaper("stopped-second")
+        try await testDisplayIDReuse(display, first, second)
         try await testManualStopTopology(first, second)
         try await testStopRekeyCancellation(display, first)
         let failure = try wallpaper("fail-activate-stopped")
