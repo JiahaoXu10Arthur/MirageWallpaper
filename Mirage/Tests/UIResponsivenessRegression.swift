@@ -181,42 +181,252 @@ private struct UIResponsivenessRegression {
         }
     }
 
+    static func testManualStopIdentity() throws {
+        let a = DisplayKey(rawValue: "uuid:11111111-1111-1111-1111-111111111111")
+        let b = DisplayKey(rawValue: "uuid:22222222-2222-2222-2222-222222222222")
+        let duplicate = DisplayKey(rawValue: a.rawValue + "#1")
+        let idx0 = DisplayKey(rawValue: "idx:0")
+        let idx1 = DisplayKey(rawValue: "idx:1")
+        func info(_ key: DisplayKey, _ id: CGDirectDisplayID, _ index: Int = 0) -> DisplayInfo {
+            DisplayInfo(key: key, displayID: id, index: index, name: "Identity test",
+                        size: CGSize(width: 1920, height: 1080), isMain: index == 0)
+        }
+        var stops = ManualDisplayStopState(connected: [info(idx0, 10), info(idx1, 20, 1)])
+        stops.stop(idx0)
+        try require(stops.keys == [idx0] && stops.saved.isEmpty, "Index stop was persisted")
+        stops.reconcile([info(idx0, 20), info(idx1, 10, 1)])
+        try require(stops.keys == [idx1], "Reordering transferred an index stop to another display")
+        stops.resume(idx1)
+        stops.reconcile([info(idx0, 20), info(idx1, 10, 1)])
+        try require(stops.keys.isEmpty, "Explicit resume retained a temporary stop")
+        stops.stop(idx1)
+        stops.reconcile([info(idx0, 20)])
+        stops.reconcile([info(idx0, 10)])
+        try require(stops.keys.isEmpty, "Disconnected temporary ID was reused as a stop")
+
+        for serial in [0, 123] {
+            let original = DisplayKey(rawValue: "vms:1:2:\(serial):0")
+            let changed = DisplayKey(rawValue: "vms:1:2:\(serial):1")
+            var framebuffer = ManualDisplayStopState(connected: [info(original, 10)])
+            framebuffer.stop(original)
+            try require(framebuffer.saved.isEmpty, "Framebuffer unit key was persisted")
+            framebuffer.reconcile([info(changed, 10)])
+            try require(framebuffer.keys == [changed], "Continuous framebuffer stop lost its ID binding")
+        }
+
+        var stable = ManualDisplayStopState(connected: [info(a, 10)])
+        stable.stop(a)
+        try require(stable.saved == [a.rawValue], "Unique UUID was not persisted")
+        stable.reconcile([])
+        stable.reconcile([info(a, 30)])
+        try require(stable.keys == [a], "Stable stop did not survive reconnect")
+        let reloaded = ManualDisplayStopState(saved: stable.saved, connected: [info(a, 40)])
+        try require(reloaded.keys == [a], "Stable stop did not survive reload")
+        stable.resume(a)
+        try require(stable.keys.isEmpty && stable.saved.isEmpty, "Stable resume was not persisted")
+
+        let collision = [info(a, 20), info(duplicate, 10, 1)]
+        let ambiguousReload = ManualDisplayStopState(saved: [a.rawValue], connected: collision)
+        try require(ambiguousReload.keys.isEmpty && ambiguousReload.saved.isEmpty,
+                    "A stored ambiguous UUID was assigned to the first collision member")
+        var known = ManualDisplayStopState(connected: [info(a, 10)])
+        known.stop(a)
+        known.reconcile(collision)
+        try require(known.keys == [duplicate] && known.saved.isEmpty,
+                    "A UUID collision transferred a known stop to another display")
+        known.reconcile([info(a, 10), info(duplicate, 20, 1)])
+        try require(known.keys == [a] && known.saved.isEmpty, "Collision reorder lost session identity")
+        known.reconcile([info(a, 20)])
+        try require(known.keys.isEmpty, "Disconnected collision stop moved to remaining display")
+        var both = ManualDisplayStopState(connected: collision)
+        both.stop(a)
+        both.stop(duplicate)
+        try require(both.keys == [a, duplicate] && both.saved.isEmpty,
+                    "One of the colliding UUID keys was persisted")
+
+        var replaced = ManualDisplayStopState(connected: [info(a, 10)])
+        replaced.stop(a)
+        replaced.reconcile([info(b, 10)])
+        try require(!replaced.keys.contains(b), "Reused ID stopped a different known UUID")
+        var temporaryKey = ManualDisplayStopState(connected: [info(a, 10)])
+        temporaryKey.stop(a)
+        temporaryKey.reconcile([info(idx0, 10)])
+        temporaryKey.resume(idx0)
+        temporaryKey.reconcile([info(a, 10)])
+        try require(temporaryKey.keys.isEmpty && temporaryKey.saved.isEmpty,
+                    "Resume under a temporary key left a durable stop behind")
+        temporaryKey.stop(a)
+        temporaryKey.reconcile([info(idx0, 10)])
+        let replacedKeys = temporaryKey.reconcile([info(b, 10)])
+        try require(!temporaryKey.keys.contains(b) && replacedKeys.isEmpty,
+                    "Temporary key lost known identity and stopped a replacement UUID")
+        let legacy = ManualDisplayStopState(saved: [idx0.rawValue, "vms:1:2:0:0",
+                                                   "uuid:invalid", duplicate.rawValue, a.rawValue],
+                                           connected: [info(a, 10)])
+        try require(legacy.saved == [a.rawValue] && legacy.keys == [a],
+                    "Legacy positional or invalid stop keys were loaded")
+        print("PASS: UUID persistence, positional/framebuffer session stops, collisions, reorder and disconnect")
+    }
+
+    static func testManualStopTopology(_ first: WEWallpaper, _ second: WEWallpaper) async throws {
+        let uuid = "uuid:33333333-3333-3333-3333-333333333333"
+        for rawKeys in [["idx:0", "idx:1"], [uuid, uuid + "#1"]] {
+            let keys = rawKeys.map(DisplayKey.init(rawValue:))
+            func info(_ key: DisplayKey, _ id: CGDirectDisplayID, _ index: Int) -> DisplayInfo {
+                DisplayInfo(key: key, displayID: id, index: index, name: "Topology test",
+                            size: CGSize(width: 1920, height: 1080), isMain: index == 0)
+            }
+            let initial = [info(keys[0], 9401, 0), info(keys[1], 9402, 1)]
+            let suite = "mirage-stop-topology-\(UUID())"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let model = WallpaperViewModel(initialStates: [
+                keys[0]: DisplayWallpaperState(wallpaper: first, runtime: .init()),
+                keys[1]: DisplayWallpaperState(wallpaper: second, runtime: .init())
+            ], stoppedDisplayDefaults: defaults, connectedDisplays: initial)
+            defer { model.renderer.stopAllAndWait() }
+            model.selectedDisplayKey = keys[0]
+            model.stopWallpaper()
+            model.reconcileDisplays([info(keys[0], 9402, 0), info(keys[1], 9401, 1)])
+            try await waitUntil("other display state follows its ID") {
+                model.state(for: keys[0])?.wallpaper.id == second.id && model.renderer.isRendering(onDisplay: 9402)
+            }
+            try require(model.manuallyStoppedDisplays == [keys[1]] && model.state(for: keys[1]) == nil &&
+                        !model.renderer.hasCoverageOrWork(onDisplay: 9401),
+                        "Reordered stopped display retained another display's state or renderer")
+            try require(defaults.stringArray(forKey: "ManuallyStoppedDisplays") == [],
+                        "Ambiguous topology stop was persisted")
+            // If the active display disconnects instead, the stopped display
+            // takes its key. The old destination state must not restart it.
+            let collapse = WallpaperViewModel(initialStates: [
+                keys[0]: DisplayWallpaperState(wallpaper: second, runtime: .init()),
+                keys[1]: DisplayWallpaperState(wallpaper: first, runtime: .init())
+            ], stoppedDisplayDefaults: defaults,
+               connectedDisplays: [info(keys[0], 9402, 0), info(keys[1], 9401, 1)])
+            defer { collapse.renderer.stopAllAndWait() }
+            collapse.selectedDisplayKey = keys[1]
+            collapse.stopWallpaper()
+            collapse.reconcileDisplays([info(keys[0], 9401, 0)])
+            try require(collapse.manuallyStoppedDisplays == [keys[0]] && collapse.state(for: keys[0]) == nil &&
+                        !collapse.renderer.hasCoverageOrWork(onDisplay: 9401),
+                        "Disconnected display's destination state restarted the stopped display")
+            model.reconcileDisplays([info(keys[0], 9402, 0)])
+            try require(model.manuallyStoppedDisplays.isEmpty, "Temporary stop survived its display's disconnect")
+            model.reconcileDisplays([info(keys[0], 9402, 0), info(keys[1], 9403, 1)])
+            try await waitUntil("replacement at old index inherits") {
+                model.state(for: keys[1])?.wallpaper.id == second.id && model.renderer.isRendering(onDisplay: 9403)
+            }
+        }
+        let stableKey = DisplayKey(rawValue: uuid)
+        let stableDisplay = DisplayInfo(key: stableKey, displayID: 9401, index: 0, name: "Stable UUID",
+                                        size: CGSize(width: 1920, height: 1080), isMain: true)
+        let stableSuite = "mirage-stable-stop-\(UUID())"
+        let stableDefaults = UserDefaults(suiteName: stableSuite)!
+        defer { stableDefaults.removePersistentDomain(forName: stableSuite) }
+        let stableStates = [stableKey: DisplayWallpaperState(wallpaper: first, runtime: .init())]
+        let stableModel = WallpaperViewModel(initialStates: stableStates, stoppedDisplayDefaults: stableDefaults,
+                                            connectedDisplays: [stableDisplay])
+        defer { stableModel.renderer.stopAllAndWait() }
+        stableModel.stopWallpaper()
+        try require(stableDefaults.stringArray(forKey: "ManuallyStoppedDisplays") == [uuid],
+                    "A stable UUID stop was not written to preferences")
+        let stableReload = WallpaperViewModel(initialStates: stableStates, stoppedDisplayDefaults: stableDefaults,
+                                             connectedDisplays: [stableDisplay])
+        defer { stableReload.renderer.stopAllAndWait() }
+        try require(stableReload.displayStates.isEmpty && stableReload.manuallyStoppedDisplays == [stableKey],
+                    "A stable UUID stop was not restored by the view model")
+        print("PASS: stable UUID persistence and reordered temporary stops preserve display identity")
+    }
+
+    static func testStopRekeyCancellation(_ display: DisplayInfo, _ wallpaper: WEWallpaper) async throws {
+        let suite = "mirage-stop-rekey-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let model = WallpaperViewModel(initialStates: [display.key:
+            DisplayWallpaperState(wallpaper: wallpaper, runtime: .init())],
+            stoppedDisplayDefaults: defaults, connectedDisplays: [display])
+        defer { model.renderer.stopAllAndWait() }
+        model.selectedDisplayKey = display.key
+        model.stopWallpaper()
+        let held = try self.wallpaper("held-activate-rekey-\(UUID().uuidString)")
+        let entry = held.renderDirectory.path
+        var result: Bool?
+        model.assign(held, to: display.key) { result = $0 }
+        try await waitUntil("old-key renderer received activate") {
+            FileManager.default.fileExists(atPath: entry + ".activating")
+        }
+        let movedKey = DisplayKey(rawValue: display.key.rawValue + "#1")
+        model.reconcileDisplays([
+            DisplayInfo(key: display.key, displayID: 9404, index: 0, name: "Collision",
+                        size: display.size, isMain: true),
+            DisplayInfo(key: movedKey, displayID: display.displayID, index: 1, name: display.name,
+                        size: display.size, isMain: false)
+        ])
+        try Data().write(to: URL(fileURLWithPath: entry + ".release"))
+        try await waitUntil("old-key renderer emitted late activation") {
+            FileManager.default.fileExists(atPath: entry + ".activated")
+        }
+        try await waitUntil("old-key activation rejected and renderer stopped") {
+            result != nil && !model.renderer.hasCoverageOrWork(onDisplay: display.displayID)
+        }
+        try require(result == false && model.manuallyStoppedDisplays == [movedKey] &&
+                    model.state(for: display.key) == nil && model.state(for: movedKey) == nil,
+                    "Late old-key activation crossed a stop's topology remapping")
+        try require(defaults.stringArray(forKey: "ManuallyStoppedDisplays") == [],
+                    "Collision retained an ambiguous persistent stop")
+        print("PASS: topology rekey cancels a real in-flight renderer activation")
+    }
+
     static func testStoppedDisplays() async throws {
+        try testManualStopIdentity()
         guard let display = DisplayRegistry.shared.connected.first else {
             throw RegressionFailure(description: "A display is required for stopped-display regression")
         }
         let rendererDirectory = Bundle.main.resourceURL!.appending(path: "Renderers")
         try FileManager.default.createDirectory(at: rendererDirectory, withIntermediateDirectories: true)
-        try FileManager.default.createSymbolicLink(at: rendererDirectory.appending(path: "VideoWallpaper"),
-                                                  withDestinationURL: Bundle.main.executableURL!)
+        let videoRenderer = rendererDirectory.appending(path: "VideoWallpaper")
+        if !FileManager.default.fileExists(atPath: videoRenderer.path) {
+            try FileManager.default.createSymbolicLink(at: videoRenderer,
+                                                      withDestinationURL: Bundle.main.executableURL!)
+        }
         let suite = "mirage-stopped-test-\(UUID())"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let first = try wallpaper("stopped-first")
         let second = try wallpaper("stopped-second")
+        try await testManualStopTopology(first, second)
+        try await testStopRekeyCancellation(display, first)
         let failure = try wallpaper("fail-activate-stopped")
         let slow = try wallpaper("slow-activate-stopped")
-        let held = try wallpaper("held-activate-stopped")
-        let other = DisplayInfo(key: DisplayKey(rawValue: "test:other"), displayID: 9002,
+        let held = try wallpaper("held-activate-stopped-\(UUID().uuidString)")
+        let other = DisplayInfo(key: DisplayKey(rawValue: "uuid:00000000-0000-0000-0000-000000009002"), displayID: 9002,
                                 index: 1, name: "Other", size: CGSize(width: 1920, height: 1080), isMain: false)
-        let fresh = DisplayInfo(key: DisplayKey(rawValue: "test:new"), displayID: 9003,
+        let fresh = DisplayInfo(key: DisplayKey(rawValue: "uuid:00000000-0000-0000-0000-000000009003"), displayID: 9003,
                                 index: 2, name: "New", size: CGSize(width: 1920, height: 1080), isMain: false)
         let initial = [display.key: DisplayWallpaperState(wallpaper: first, runtime: .init()),
                        other.key: DisplayWallpaperState(wallpaper: second, runtime: .init())]
-        let invalidModel = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        defaults.set(["idx:0", "vms:1:2:0:0", "uuid:invalid",
+                      display.key.rawValue + "#1"], forKey: "ManuallyStoppedDisplays")
+        let invalidModel = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults,
+                                                 connectedDisplays: [display, other])
+        try require(invalidModel.manuallyStoppedDisplays.isEmpty &&
+                    defaults.stringArray(forKey: "ManuallyStoppedDisplays") == [],
+                    "Unstable legacy stop markers were not ignored and cleaned")
         defer { invalidModel.renderer.stopAllAndWait() }
         var invalidResult: Bool?
         invalidModel.assign(WallpaperViewModel.invalidWallpaper, to: display.key) { invalidResult = $0 }
         try require(invalidResult == false && invalidModel.manuallyStoppedDisplays.isEmpty,
                     "Validation failure was recorded as a manual stop")
-        let invalidReload = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        let invalidReload = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults,
+                                                 connectedDisplays: [display, other])
         defer { invalidReload.renderer.stopAllAndWait() }
         try require(invalidReload.state(for: display.key) != nil, "Validation failure persisted a manual stop")
-        let model = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        let model = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults,
+                                                 connectedDisplays: [display, other])
         defer { model.renderer.stopAllAndWait() }
         model.selectedDisplayKey = display.key
         model.stopWallpaper()
-        model.selectedDisplayKey = other.key
+        try require(model.selectedDisplayKey == display.key, "Stopping unexpectedly changed selection")
         try require(model.manuallyStoppedDisplays.contains(display.key), "Manual stop was not recorded")
         try require(!model.allowsPlaylistAdvance(on: display.key, manually: false, updateOnPause: true),
                     "A stopped display permits automatic playlist advancement")
@@ -235,10 +445,12 @@ private struct UIResponsivenessRegression {
         model.reconcileDisplays([display, other])
         try require(model.state(for: display.key) == nil && model.manuallyStoppedDisplays.contains(display.key),
                     "Disconnect/reconnect lost the stop marker")
-        let reloaded = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        let reloaded = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults,
+                                                 connectedDisplays: [display, other])
         defer { reloaded.renderer.stopAllAndWait() }
-        try require(reloaded.state(for: display.key) == nil && reloaded.state(for: other.key) != nil,
-                    "Relaunch restored a stale assignment over the persisted manual stop")
+        let persistedMainStop = defaults.stringArray(forKey: "ManuallyStoppedDisplays")?.contains(display.key.rawValue) == true
+        try require((reloaded.state(for: display.key) == nil) == persistedMainStop && reloaded.state(for: other.key) != nil,
+                    "Relaunch did not respect the persisted stop state")
 
         var cancelledResult: Bool?
         let activationPath = held.renderDirectory.path + ".activating"
@@ -250,6 +462,7 @@ private struct UIResponsivenessRegression {
         }
         model.selectedDisplayKey = display.key
         model.stopWallpaper()
+        let stopsBeforeLateActivation = defaults.stringArray(forKey: "ManuallyStoppedDisplays") ?? []
         try Data().write(to: URL(fileURLWithPath: releasePath))
         try await waitUntil("renderer emitted late activation") {
             FileManager.default.fileExists(atPath: emittedPath)
@@ -260,9 +473,12 @@ private struct UIResponsivenessRegression {
         try await waitUntil("stopped candidate exit") {
             !model.renderer.hasCoverageOrWork(onDisplay: display.displayID)
         }
-        let cancelledReload = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        let cancelledReload = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults,
+                                                 connectedDisplays: [display, other])
         defer { cancelledReload.renderer.stopAllAndWait() }
-        try require(cancelledReload.state(for: display.key) == nil, "Cancelled assignment cleared persisted stop")
+        try require(defaults.stringArray(forKey: "ManuallyStoppedDisplays") == stopsBeforeLateActivation &&
+                    (cancelledReload.state(for: display.key) == nil) == stopsBeforeLateActivation.contains(display.key.rawValue),
+                    "Cancelled assignment changed persisted stop state")
 
         var policyResult: Bool?
         model.assign(slow, to: display.key) { policyResult = $0 }
@@ -270,7 +486,8 @@ private struct UIResponsivenessRegression {
         try require(policyResult == true && !model.manuallyStoppedDisplays.contains(display.key) &&
                     model.state(for: display.key)?.wallpaper.id == slow.id,
                     "Policy stop accepted an explicit assignment without clearing the manual stop")
-        let policyReload = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        let policyReload = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults,
+                                                 connectedDisplays: [display, other])
         defer { policyReload.renderer.stopAllAndWait() }
         try require(policyReload.state(for: display.key) != nil, "Policy commit did not persist the cleared stop")
         model.stopWallpaper()
@@ -285,7 +502,8 @@ private struct UIResponsivenessRegression {
         }
         try require(applied && !model.manuallyStoppedDisplays.contains(display.key),
                     "Successful explicit assignment did not resume display management")
-        let resumed = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        let resumed = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults,
+                                                 connectedDisplays: [display, other])
         defer { resumed.renderer.stopAllAndWait() }
         try require(resumed.state(for: display.key) != nil, "Successful assignment did not persist the cleared stop")
         model.applyPlaybackPolicy(.stop)
@@ -294,9 +512,13 @@ private struct UIResponsivenessRegression {
         model.stopAllWallpapers()
         try require(model.manuallyStoppedDisplays.isSuperset(of: [display.key, other.key, fresh.key]),
                     "Stop all omitted a connected or disconnected saved display")
-        let stoppedAll = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        let stoppedAll = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults,
+                                                 connectedDisplays: [display, other])
         defer { stoppedAll.renderer.stopAllAndWait() }
-        try require(stoppedAll.displayStates.isEmpty, "Stop all did not survive reload")
+        let savedStoppedKeys = Set((defaults.stringArray(forKey: "ManuallyStoppedDisplays") ?? [])
+            .map(DisplayKey.init(rawValue:)))
+        try require(Set(stoppedAll.displayStates.keys) == Set(initial.keys).subtracting(savedStoppedKeys),
+                    "Stop all reload did not distinguish durable and temporary display identities")
         print("PASS: manual stop, inherited displays, reconnect, persistence, failed/successful resume, playlist and policy boundaries")
     }
 
