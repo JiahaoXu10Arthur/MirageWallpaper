@@ -341,6 +341,37 @@ private struct UIResponsivenessRegression {
         print("PASS: stable UUID persistence and reordered temporary stops preserve display identity")
     }
 
+    static func testAmbiguousStoppedAssignments(_ first: WEWallpaper, _ second: WEWallpaper) throws {
+        let key = DisplayKey(rawValue: "uuid:77777777-7777-7777-7777-777777777777")
+        let duplicate = DisplayKey(rawValue: key.rawValue + "#1")
+        let other = DisplayKey(rawValue: "uuid:88888888-8888-8888-8888-888888888888")
+        func info(_ key: DisplayKey, _ id: CGDirectDisplayID, _ index: Int) -> DisplayInfo {
+            DisplayInfo(key: key, displayID: id, index: index, name: "Stopped UUID collision",
+                        size: CGSize(width: 1920, height: 1080), isMain: index == 0)
+        }
+        let collision = [info(key, 9501, 0), info(duplicate, 9502, 1), info(other, 9503, 2)]
+        let suite = "mirage-ambiguous-stop-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let states = [key: DisplayWallpaperState(wallpaper: first, runtime: .init()),
+                      duplicate: DisplayWallpaperState(wallpaper: first, runtime: .init()),
+                      other: DisplayWallpaperState(wallpaper: second, runtime: .init())]
+        defaults.set([key.rawValue], forKey: "ManuallyStoppedDisplays")
+        let model = WallpaperViewModel(initialStates: states, stoppedDisplayDefaults: defaults,
+                                       connectedDisplays: collision)
+        defer { model.renderer.stopAllAndWait() }
+        try require(model.state(for: key) == nil && model.state(for: duplicate) == nil,
+                    "Rejected UUID stop restored a stale assignment onto an ambiguous display")
+        try require(model.state(for: other)?.wallpaper.id == second.id && model.manuallyStoppedDisplays.isEmpty,
+                    "Collision cleanup discarded an unrelated assignment or stopped an ambiguous display")
+        // A collision by itself must not discard assignments selected by the user.
+        let noStop = WallpaperViewModel(initialStates: states, connectedDisplays: collision)
+        defer { noStop.renderer.stopAllAndWait() }
+        try require(noStop.displayStates.count == states.count,
+                    "Collision cleanup discarded assignments without a saved stop")
+        print("PASS: rejected collision stops exclude their stale assignments and preserve unrelated states")
+    }
+
     static func testStopRekeyCancellation(_ display: DisplayInfo, _ wallpaper: WEWallpaper) async throws {
         let suite = "mirage-stop-rekey-\(UUID())"
         let defaults = UserDefaults(suiteName: suite)!
@@ -465,6 +496,7 @@ private struct UIResponsivenessRegression {
         defer { defaults.removePersistentDomain(forName: suite) }
         let first = try wallpaper("stopped-first")
         let second = try wallpaper("stopped-second")
+        try testAmbiguousStoppedAssignments(first, second)
         try await testDisplayIDReuse(display, first, second)
         try await testManualStopTopology(first, second)
         try await testStopRekeyCancellation(display, first)

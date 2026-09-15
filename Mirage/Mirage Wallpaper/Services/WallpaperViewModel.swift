@@ -16,9 +16,19 @@ struct ManualDisplayStopState {
     private var stoppedIDs: Set<CGDirectDisplayID> = []
     private var knownUUIDs: [CGDirectDisplayID: UUID] = [:]
     private var connected: [DisplayInfo]
+    // Startup-only evidence: rejecting an ambiguous stop must also reject its
+    // stale assignments, without marking either collision member as stopped.
+    private let invalidatedSavedUUIDs: Set<UUID>
+    var hasInvalidatedSavedStops: Bool { !invalidatedSavedUUIDs.isEmpty }
+
+    func invalidatesRestoredAssignment(_ key: DisplayKey) -> Bool {
+        Self.uuid(key).map { invalidatedSavedUUIDs.contains($0) } ?? false
+    }
 
     init(saved: [String] = [], connected: [DisplayInfo] = []) {
         self.connected = connected
+        invalidatedSavedUUIDs = Set(saved.map(DisplayKey.init(rawValue:)).compactMap(Self.uuid))
+            .filter { identity in connected.filter { Self.uuid($0.key) == identity }.count > 1 }
         persistent = Set(saved.map(DisplayKey.init(rawValue:)))
             .filter { Self.canPersist($0, connected: connected) }
         stoppedIDs = Set(connected.filter { persistent.contains($0.key) }.map(\.displayID))
@@ -275,25 +285,24 @@ class WallpaperViewModel: PlaylistPlayback {
         self.stoppedDisplayDefaults = stopDefaults
         let registry = DisplayRegistry.shared
         let savedStops = stopDefaults?.stringArray(forKey: Self.stoppedDisplaysDefaultsKey) ?? []
-        let stops = ManualDisplayStopState(saved: savedStops, connected: connectedDisplays ?? registry.connected)
+        let connected = connectedDisplays ?? registry.connected
+        let mainKey = connected.first(where: \.isMain)?.key ?? connected.first?.key
+        let stops = ManualDisplayStopState(saved: savedStops, connected: connected)
         manualStops = stops
-        if savedStops != stops.saved {
-            stopDefaults?.set(stops.saved, forKey: Self.stoppedDisplaysDefaultsKey)
-        }
         let stored = UserDefaults.standard.string(forKey: Self.selectedDisplayDefaultsKey)
             .map(DisplayKey.init(rawValue:))
-        let connectedKeys = registry.connectedKeys
+        let connectedKeys = Set(connected.map(\.key))
         if let first = initialStates?.keys.sorted(by: { $0.rawValue < $1.rawValue }).first {
             selectedDisplayKey = first
         } else if let stored, connectedKeys.contains(stored) {
             selectedDisplayKey = stored
         } else {
-            selectedDisplayKey = registry.mainKey ?? DisplayKey(rawValue: "idx:0")
+            selectedDisplayKey = mainKey ?? DisplayKey(rawValue: "idx:0")
         }
 
         var loaded = initialStates ?? Self.loadPersistedStates()
         if initialStates == nil, loaded.isEmpty, let migrated = Self.loadLegacyState(),
-           let mainKey = registry.mainKey {
+           let mainKey {
             loaded[mainKey] = migrated
         }
         if initialStates == nil && Self.repairRuntimesZeroedByLegacyPause() {
@@ -306,7 +315,9 @@ class WallpaperViewModel: PlaylistPlayback {
             }
         }
         // A manual stop wins over an older assignment or legacy migration.
-        loaded = loaded.filter { !manuallyStoppedDisplays.contains($0.key) }
+        loaded = loaded.filter {
+            !manuallyStoppedDisplays.contains($0.key) && !stops.invalidatesRestoredAssignment($0.key)
+        }
         displayStates = loaded
         refreshSelectedState()
         displayStatesChanges.send(loaded)
@@ -320,7 +331,35 @@ class WallpaperViewModel: PlaylistPlayback {
         NotificationCenter.default.addObserver(
             self, selector: #selector(displayTopologyChanged),
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
-        persistStates()
+        if persistsChanges && stops.hasInvalidatedSavedStops {
+            // Finish startup cleanup before deleting its evidence. Otherwise a
+            // second initialization can reload the old assignment without a stop.
+            if Self.persistStartupCleanup(loaded, mainKey: mainKey) {
+                persistStoppedDisplays()
+            }
+        } else {
+            persistStates()
+        }
+    }
+
+    private static func persistStartupCleanup(_ states: [DisplayKey: DisplayWallpaperState],
+                                              mainKey: DisplayKey?) -> Bool {
+        do {
+            let encoder = JSONEncoder()
+            let raw = Dictionary(uniqueKeysWithValues: states.map { ($0.key.rawValue, $0.value) })
+            let data = try encoder.encode(raw)
+            let legacy = try mainKey.flatMap { states[$0] }.map { try encoder.encode($0.wallpaper) }
+            UserDefaults.standard.set(data, forKey: assignmentsDefaultsKey)
+            if let legacy {
+                UserDefaults.standard.set(legacy, forKey: legacyWallpaperDefaultsKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: legacyWallpaperDefaultsKey)
+            }
+            return true
+        } catch {
+            // Retain the original stop marker if serialization fails.
+            return false
+        }
     }
 
     deinit {
