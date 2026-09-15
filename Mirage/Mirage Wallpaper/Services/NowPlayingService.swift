@@ -174,12 +174,12 @@ final class NowPlayingService {
 struct NowPlayingArtworkCache {
     private var lastResult: (url: String, colors: [[Double]])?
     private let directory: URL
-    private let makePalette: (CGImage) -> [[Double]]
+    private let makePalette: (CGImage) -> [[Double]]?
 
     init(directory: URL = FileManager.default.urls(
         for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Mirage/NowPlaying", isDirectory: true),
-         makePalette: @escaping (CGImage) -> [[Double]] = Self.palette) {
+         makePalette: @escaping (CGImage) -> [[Double]]? = Self.palette) {
         self.directory = directory
         self.makePalette = makePalette
     }
@@ -211,12 +211,17 @@ struct NowPlayingArtworkCache {
                 kCGImageSourceThumbnailMaxPixelSize: 48,
                 kCGImageSourceCreateThumbnailWithTransform: true
               ] as CFDictionary) else { return nil }
-        let result = (url: url.path, colors: makePalette(image))
+        guard let colors = makePalette(image) else {
+            // Preserve this poll's fallback payload, but retry extraction next
+            // time and retain only the previous successful cache entry.
+            return (url: url.path, colors: Self.fallbackPalette())
+        }
+        let result = (url: url.path, colors: colors)
         lastResult = result
         return result
     }
 
-    static func palette(_ image: CGImage) -> [[Double]] {
+    static func palette(_ image: CGImage) -> [[Double]]? {
         let side = 32
         var pixels = [UInt8](repeating: 0, count: side * side * 4)
         guard let space = CGColorSpace(name: CGColorSpace.sRGB),
@@ -224,7 +229,7 @@ struct NowPlayingArtworkCache {
                 data: &pixels, width: side, height: side, bitsPerComponent: 8,
                 bytesPerRow: side * 4, space: space,
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-        else { return fallbackPalette() }
+        else { return nil }
         context.interpolationQuality = .medium
         context.draw(image, in: CGRect(x: 0, y: 0, width: side, height: side))
         var buckets: [Int: (count: Int, r: Double, g: Double, b: Double, score: Double)] = [:]
@@ -249,7 +254,7 @@ struct NowPlayingArtworkCache {
         for color in ranked where selected.count < 3 {
             if selected.allSatisfy({ distance($0, color) > 0.16 }) { selected.append(color) }
         }
-        guard let primary = selected.first ?? ranked.first else { return fallbackPalette() }
+        guard let primary = selected.first ?? ranked.first else { return nil }
         while selected.count < 3 {
             let factor = selected.count == 1 ? 1.25 : 0.65
             selected.append(primary.map { min(max($0 * factor, 0), 1) })
