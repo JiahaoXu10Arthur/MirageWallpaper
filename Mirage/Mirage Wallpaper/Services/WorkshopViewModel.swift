@@ -330,9 +330,12 @@ class WorkshopViewModel {
 
     typealias PageSearch = (Int) async throws -> (items: [WorkshopItem], total: Int)
     @ObservationIgnored private let pageSearch: PageSearch?
+    @ObservationIgnored private let isSearchAuthenticated: () -> Bool
 
-    init(subscriptionCatalog: [WorkshopItem]? = nil, pageSearch: PageSearch? = nil) {
+    init(subscriptionCatalog: [WorkshopItem]? = nil, pageSearch: PageSearch? = nil,
+         isSearchAuthenticated: @escaping () -> Bool = { SteamServiceManager.shared.isLoggedIn }) {
         self.pageSearch = pageSearch
+        self.isSearchAuthenticated = isSearchAuthenticated
         if let subscriptionCatalog {
             subscriptionCatalogItems = subscriptionCatalog
             rebuildSubscriptionPage(startIndex: 0)
@@ -381,7 +384,10 @@ class WorkshopViewModel {
             .sink { [weak self] isLoggedIn in
                 guard let self else { return }
                 self.refreshSetupState()
-                guard isLoggedIn else { return }
+                guard isLoggedIn else {
+                    self.refreshSearchAuthentication()
+                    return
+                }
                 self.processDownloadQueue()
                 if let item = self.selectedItem {
                     self.refreshSubscriptionStates(for: [item])
@@ -685,8 +691,10 @@ class WorkshopViewModel {
         let generation = searchGeneration
         let criteria = currentSearchCriteria
         let requestPage = page ?? (criteria == displayedSearchCriteria ? currentPage : 1)
-        if criteria.showOnly.contains(.myFavourites), !SteamServiceManager.shared.isLoggedIn {
-            finishSearchFailure(L("需要登录 Steam"), criteria: criteria, page: requestPage)
+        if criteria.showOnly.contains(.myFavourites), !isSearchAuthenticated() {
+            searchTask = nil
+            clearSearchResults()
+            error = L("需要登录 Steam")
             return
         }
         isLoading = true
@@ -793,6 +801,43 @@ class WorkshopViewModel {
                 self.steamServiceStatus.browsingAPI = .unavailable(error.localizedDescription)
             }
         }
+    }
+
+    // Called by the login-state observer even when no favorite-ID update is emitted.
+    func refreshSearchAuthentication() {
+        guard !isSearchAuthenticated() else { return }
+        let hasAccountResults = displayedSearchCriteria?.showOnly.contains(.myFavourites) == true
+        let hasAccountRequest = requestedSearchCriteria?.showOnly.contains(.myFavourites) == true
+        let hasAccountFailure = failedSearch?.criteria.showOnly.contains(.myFavourites) == true
+        guard workshopShowOnly.contains(.myFavourites) || hasAccountResults || hasAccountRequest || hasAccountFailure else {
+            return
+        }
+        searchTask?.cancel()
+        searchTask = nil
+        searchGeneration += 1
+        clearSearchResults()
+        if workshopShowOnly.contains(.myFavourites) {
+            error = L("需要登录 Steam")
+        } else {
+            // The controls may already describe a public query while old favorites remain visible.
+            search(page: 1)
+        }
+    }
+
+    private func clearSearchResults() {
+        items = []
+        totalItems = 0
+        currentPage = 1
+        loadedPage = 1
+        displayedSearchCriteria = nil
+        requestedSearchCriteria = nil
+        requestedPage = nil
+        failedSearch = nil
+        pageNavigationMessage = nil
+        error = nil
+        isLoading = false
+        steamServiceStatus.browsingAPI = .unknown
+        pageLoadRevision &+= 1
     }
 
     func refreshSearch() {

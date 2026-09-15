@@ -138,6 +138,7 @@ private struct UIResponsivenessRegression {
                 try await testWorkshopPagination()
                 try await testWorkshopSearchCommit()
                 try await testWorkshopSearchBoundaries()
+                try await testWorkshopSearchAuthentication()
                 print("WorkshopPaginationRegression: all checks passed")
                 return
             }
@@ -169,6 +170,7 @@ private struct UIResponsivenessRegression {
             try await testWorkshopPagination()
             try await testWorkshopSearchCommit()
             try await testWorkshopSearchBoundaries()
+            try await testWorkshopSearchAuthentication()
             try await testConditions()
             try testObservation()
             try await testImages()
@@ -1029,6 +1031,142 @@ private struct UIResponsivenessRegression {
         try require(model.currentPage == 1 && model.items.isEmpty && model.totalItems == 0,
                     "Latest query failed to replace the corrective request")
         print("PASS: reverted-criteria retry, empty-result normalization, corrective fetch/failure/retry and supersession")
+    }
+
+    static func testWorkshopSearchAuthentication() async throws {
+        final class SearchProbe {
+            typealias Result = (items: [WorkshopItem], total: Int)
+            var authenticated = true
+            var pages: [Int] = []
+            var replies: [CheckedContinuation<Result, Error>] = []
+            func load(_ page: Int) async throws -> Result {
+                pages.append(page)
+                return try await withCheckedThrowingContinuation { replies.append($0) }
+            }
+        }
+        let storedShowOnly = UserDefaults.standard.object(forKey: "WorkshopShowOnlyV2")
+        defer { UserDefaults.standard.set(storedShowOnly, forKey: "WorkshopShowOnlyV2") }
+        let item = WorkshopItem(publishedFileId: "account-favorite", title: "Account favorite", itemDescription: "",
+            previewImageURL: nil, tags: [], subscriptions: 0, favorited: 0, views: 0, fileSize: 1,
+            timeCreated: Date(), timeUpdated: Date(), creatorSteamId: "", wallpaperType: "video")
+        let probe = SearchProbe()
+        let model = WorkshopViewModel(subscriptionCatalog: [], pageSearch: probe.load,
+                                      isSearchAuthenticated: { probe.authenticated })
+        let total = model.itemsPerPage * 4
+        let failure = NSError(domain: "SearchAuthenticationRegression", code: 1)
+        model.workshopShowOnly = [.myFavourites]
+        model.search(page: 2)
+        try await waitUntil("favorite page request") { probe.replies.count == 1 }
+        probe.replies[0].resume(returning: ([item], total))
+        try await waitUntil("favorite page completion") { !model.isLoading }
+        model.goToPage(3)
+        try await waitUntil("favorite page failure request") { probe.replies.count == 2 }
+        probe.replies[1].resume(throwing: failure)
+        try await waitUntil("favorite network failure") { !model.isLoading }
+        try require(model.currentPage == 2 && model.items.map(\.id) == [item.id] &&
+                    model.pageNavigationMessage != nil, "Authenticated network failure discarded favorites")
+
+        let beforeLogout = model.pageLoadRevision
+        probe.authenticated = false
+        // The favorite-ID observer calls this after the service clears its login state.
+        model.search(page: 1)
+        try require(model.items.isEmpty && model.totalItems == 0 && model.totalPages == 1 &&
+                    model.currentPage == 1 && model.loadedPage == 1 && model.requestedPage == nil &&
+                    !model.isLoading && !model.isLoadingNewSearch && model.pageNavigationMessage == nil &&
+                    model.error != nil && model.steamServiceStatus.browsingAPI == .unknown &&
+                    model.pageLoadRevision > beforeLogout && probe.pages == [2, 3],
+                    "Authentication failure retained account results, failed-page state or loading state")
+        model.retrySearch()
+        try require(probe.pages == [2, 3] && model.items.isEmpty && !model.isLoading,
+                    "Retry while logged out bypassed the authentication gate")
+        probe.authenticated = true
+        model.retrySearch()
+        try await waitUntil("new session retry") { probe.replies.count == 3 }
+        try require(probe.pages.last == 1, "New session reused the previous account's failed page")
+        probe.replies[2].resume(returning: ([item], total))
+        try await waitUntil("new session result") { !model.isLoading }
+        try require(model.currentPage == 1 && model.error == nil, "Login recovery retained the authentication error")
+
+        model.goToPage(2)
+        try await waitUntil("favorite request pending at logout") { probe.replies.count == 4 }
+        probe.authenticated = false
+        model.search(page: 1)
+        let logoutRevision = model.pageLoadRevision
+        probe.replies[3].resume(returning: ([item], total))
+        try await Task.sleep(for: .milliseconds(30))
+        try require(model.items.isEmpty && model.totalItems == 0 && model.currentPage == 1 &&
+                    model.pageLoadRevision == logoutRevision && model.requestedPage == nil && model.error != nil,
+                    "A late pre-logout response restored the previous account's favorites")
+
+        probe.authenticated = true
+        model.search(page: 1)
+        try await waitUntil("second pending session") { probe.replies.count == 5 }
+        probe.authenticated = false
+        model.search(page: 1)
+        probe.replies[4].resume(throwing: failure)
+        try await Task.sleep(for: .milliseconds(30))
+        try require(model.items.isEmpty && model.pageNavigationMessage == nil && model.error != failure.localizedDescription,
+                    "A late pre-logout failure replaced the authentication state")
+
+        model.workshopShowOnly = .none
+        model.search()
+        try await waitUntil("public search while logged out") { probe.replies.count == 6 }
+        try require(probe.pages.last == 1, "Public search reused an account page after logout")
+        probe.replies[5].resume(returning: ([item], total))
+        try await waitUntil("public search completion") { !model.isLoading }
+        model.goToPage(2)
+        try await waitUntil("public network failure request") { probe.replies.count == 7 }
+        probe.replies[6].resume(throwing: failure)
+        try await waitUntil("public network failure completion") { !model.isLoading }
+        try require(model.items.map(\.id) == [item.id] && model.currentPage == 1 && model.pageNavigationMessage != nil,
+                    "Logged-out public browsing lost ordinary retained-result failure handling")
+        // Exercise the same handler as the login-state observer, including public-filter transitions.
+        model.goToPage(2)
+        try await waitUntil("public request during authentication event") { probe.replies.count == 8 }
+        model.refreshSearchAuthentication()
+        try require(model.isLoading && model.requestedPage == 2 && probe.replies.count == 8,
+                    "Authentication loss unnecessarily canceled an entirely public search")
+        probe.replies[7].resume(returning: ([item], total))
+        try await waitUntil("public request preserved") { !model.isLoading }
+
+        probe.authenticated = true
+        model.workshopShowOnly = [.myFavourites]
+        model.search(page: 2)
+        try await waitUntil("favorites before switching filter") { probe.replies.count == 9 }
+        probe.replies[8].resume(returning: ([item], total))
+        try await waitUntil("favorites before switching filter ready") { !model.isLoading }
+        model.workshopShowOnly = .none
+        model.search(page: 1)
+        try await waitUntil("public filter replaces favorites") { probe.replies.count == 10 }
+        probe.replies[9].resume(throwing: failure)
+        try await waitUntil("public filter failure retaining favorites") { !model.isLoading }
+        try require(model.items.map(\.id) == [item.id] && model.currentPage == 2,
+                    "Expected retained favorite results before logout")
+        probe.authenticated = false
+        model.refreshSearchAuthentication()
+        try require(model.items.isEmpty && model.totalItems == 0 && model.currentPage == 1 && model.isLoading,
+                    "Logout retained account results after the controls switched to a public query")
+        try await waitUntil("public query restarted after authentication loss") { probe.replies.count == 11 }
+        probe.replies[10].resume(throwing: failure)
+        try await waitUntil("public restart failure") { !model.isLoading }
+        try require(model.items.isEmpty && model.totalItems == 0 && model.pageNavigationMessage == nil,
+                    "Failed public restart restored the previous account's result state")
+
+        probe.authenticated = true
+        model.workshopShowOnly = [.myFavourites]
+        model.search(page: 1)
+        try await waitUntil("favorite request before reconnect") { probe.replies.count == 12 }
+        probe.authenticated = false
+        // Reconnecting can emit only isLoggedIn=false, without changing favorite IDs.
+        model.refreshSearchAuthentication()
+        try require(!model.isLoading && model.requestedPage == nil && model.items.isEmpty && model.error != nil &&
+                    model.steamServiceStatus.browsingAPI == .unknown,
+                    "Authentication observer left a private request or phantom API check running")
+        probe.replies[11].resume(returning: ([item], total))
+        try await Task.sleep(for: .milliseconds(30))
+        try require(model.items.isEmpty && !model.isLoading && model.steamServiceStatus.browsingAPI == .unknown,
+                    "Request from the disconnected session repopulated favorites")
+        print("PASS: authentication invalidation, late account responses, login recovery and public browsing failures")
     }
 
     static func testObservation() throws {
