@@ -812,6 +812,9 @@ final class RendererController {
                              "--position-x", String(options.position.x), "--position-y", String(options.position.y),
                              "--run-seconds", String(Int(Self.preparationTimeout) + 2)]
             var environment = ProcessInfo.processInfo.environment
+            if environment["MVK_CONFIG_FAST_MATH_ENABLED"] == nil {
+                environment["MVK_CONFIG_FAST_MATH_ENABLED"] = "0"
+            }
             if options.loadFromMemory { arguments.append("--load-from-memory") }
             if wallpaper.kind == .scene {
                 arguments += [sceneAssetsDir.path, wallpaper.resolvedEntryURL.path,
@@ -1261,6 +1264,9 @@ final class RendererController {
 
         var args: [String] = []
         var env = ProcessInfo.processInfo.environment
+        if env["MVK_CONFIG_FAST_MATH_ENABLED"] == nil {
+            env["MVK_CONFIG_FAST_MATH_ENABLED"] = "0"
+        }
         if options.developerModeEnabled {
             env["WR_DEBUG"] = "1"
         }
