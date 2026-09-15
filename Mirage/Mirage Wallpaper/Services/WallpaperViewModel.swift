@@ -705,7 +705,6 @@ class WallpaperViewModel: PlaylistPlayback {
     }
 
     func clear(_ key: DisplayKey) {
-        manuallyStoppedDisplays.insert(key)
         previewSelections[key] = nil
         wallpaperChangeRequests.send(key)
         pendingPreparations[key] = nil
@@ -733,6 +732,7 @@ class WallpaperViewModel: PlaylistPlayback {
     }
 
     func stopWallpaper() {
+        manuallyStoppedDisplays.insert(selectedDisplayKey)
         clear(selectedDisplayKey)
     }
 

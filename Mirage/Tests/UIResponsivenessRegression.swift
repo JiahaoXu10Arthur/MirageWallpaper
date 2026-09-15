@@ -196,12 +196,22 @@ private struct UIResponsivenessRegression {
         let second = try wallpaper("stopped-second")
         let failure = try wallpaper("fail-activate-stopped")
         let slow = try wallpaper("slow-activate-stopped")
+        let held = try wallpaper("held-activate-stopped")
         let other = DisplayInfo(key: DisplayKey(rawValue: "test:other"), displayID: 9002,
                                 index: 1, name: "Other", size: CGSize(width: 1920, height: 1080), isMain: false)
         let fresh = DisplayInfo(key: DisplayKey(rawValue: "test:new"), displayID: 9003,
                                 index: 2, name: "New", size: CGSize(width: 1920, height: 1080), isMain: false)
         let initial = [display.key: DisplayWallpaperState(wallpaper: first, runtime: .init()),
                        other.key: DisplayWallpaperState(wallpaper: second, runtime: .init())]
+        let invalidModel = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        defer { invalidModel.renderer.stopAllAndWait() }
+        var invalidResult: Bool?
+        invalidModel.assign(WallpaperViewModel.invalidWallpaper, to: display.key) { invalidResult = $0 }
+        try require(invalidResult == false && invalidModel.manuallyStoppedDisplays.isEmpty,
+                    "Validation failure was recorded as a manual stop")
+        let invalidReload = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        defer { invalidReload.renderer.stopAllAndWait() }
+        try require(invalidReload.state(for: display.key) != nil, "Validation failure persisted a manual stop")
         let model = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
         defer { model.renderer.stopAllAndWait() }
         model.selectedDisplayKey = display.key
@@ -231,11 +241,19 @@ private struct UIResponsivenessRegression {
                     "Relaunch restored a stale assignment over the persisted manual stop")
 
         var cancelledResult: Bool?
-        model.assign(slow, to: display.key) { cancelledResult = $0 }
-        try await waitUntil("pending explicit assignment") {
-            model.renderer.hasCoverageOrWork(onDisplay: display.displayID)
+        let activationPath = held.renderDirectory.path + ".activating"
+        let releasePath = held.renderDirectory.path + ".release"
+        let emittedPath = held.renderDirectory.path + ".activated"
+        model.assign(held, to: display.key) { cancelledResult = $0 }
+        try await waitUntil("renderer received activate") {
+            FileManager.default.fileExists(atPath: activationPath)
         }
-        model.clear(display.key)
+        model.selectedDisplayKey = display.key
+        model.stopWallpaper()
+        try Data().write(to: URL(fileURLWithPath: releasePath))
+        try await waitUntil("renderer emitted late activation") {
+            FileManager.default.fileExists(atPath: emittedPath)
+        }
         try await waitUntil("stopped in-flight assignment completion") { cancelledResult != nil }
         try require(cancelledResult == false && model.state(for: display.key) == nil &&
                     model.manuallyStoppedDisplays.contains(display.key), "Late completion undid a manual stop")
@@ -255,7 +273,7 @@ private struct UIResponsivenessRegression {
         let policyReload = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
         defer { policyReload.renderer.stopAllAndWait() }
         try require(policyReload.state(for: display.key) != nil, "Policy commit did not persist the cleared stop")
-        model.clear(display.key)
+        model.stopWallpaper()
 
         let failed: Bool = await withCheckedContinuation { continuation in
             model.assign(failure, to: display.key) { continuation.resume(returning: $0) }
@@ -1323,9 +1341,18 @@ private struct UIResponsivenessRegression {
             }
             switch command["cmd"] as? String {
             case "activate":
-                if CommandLine.arguments.dropFirst().first?.contains("slow-activate") == true { usleep(300_000) }
+                let entry = CommandLine.arguments.dropFirst().first ?? ""
+                let held = entry.contains("held-activate")
+                if held {
+                    try? Data().write(to: URL(fileURLWithPath: entry + ".activating"))
+                    let deadline = Date().addingTimeInterval(5)
+                    while !FileManager.default.fileExists(atPath: entry + ".release"), Date() < deadline { usleep(5_000) }
+                } else if entry.contains("slow-activate") {
+                    usleep(300_000)
+                }
                 activated = true
                 emit(fails ? "activation-failed" : "activated")
+                if held { try? Data().write(to: URL(fileURLWithPath: entry + ".activated")) }
                 if !fails { emit("position-availability", ["x": true, "y": false]) }
             case "snapshot":
                 guard let path = command["path"] as? String, let token = command["token"] as? String else { continue }
