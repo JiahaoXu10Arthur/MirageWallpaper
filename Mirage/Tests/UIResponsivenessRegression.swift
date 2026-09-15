@@ -137,6 +137,7 @@ private struct UIResponsivenessRegression {
             if CommandLine.arguments.contains("--workshop-pagination") {
                 try await testWorkshopPagination()
                 try await testWorkshopSearchCommit()
+                try await testWorkshopSearchBoundaries()
                 print("WorkshopPaginationRegression: all checks passed")
                 return
             }
@@ -167,6 +168,7 @@ private struct UIResponsivenessRegression {
             try await testSubscriptionFiltering()
             try await testWorkshopPagination()
             try await testWorkshopSearchCommit()
+            try await testWorkshopSearchBoundaries()
             try await testConditions()
             try testObservation()
             try await testImages()
@@ -918,6 +920,115 @@ private struct UIResponsivenessRegression {
                     initial.pageNavigationMessage == nil && initial.requestedPage == nil,
                     "Initial failure did not expose the empty-view error state")
         print("PASS: unified search/filter commits, visible refresh failures, changed-query retry routing and empty results")
+    }
+
+    static func testWorkshopSearchBoundaries() async throws {
+        final class SearchProbe {
+            typealias Result = (items: [WorkshopItem], total: Int)
+            var pages: [Int] = []
+            var replies: [CheckedContinuation<Result, Error>] = []
+            func load(_ page: Int) async throws -> Result {
+                pages.append(page)
+                // Canceled requests still complete to exercise stale correction responses.
+                return try await withCheckedThrowingContinuation { replies.append($0) }
+            }
+        }
+        let item = WorkshopItem(publishedFileId: "retained", title: "Previous results", itemDescription: "",
+            previewImageURL: nil, tags: [], subscriptions: 0, favorited: 0, views: 0, fileSize: 1,
+            timeCreated: Date(), timeUpdated: Date(), creatorSteamId: "", wallpaperType: "video")
+        var correctedItem = item
+        correctedItem.publishedFileId = "corrected-page"
+        let failure = NSError(domain: "SearchBoundaryRegression", code: 1)
+        let probe = SearchProbe()
+        let model = WorkshopViewModel(subscriptionCatalog: [], pageSearch: probe.load)
+        let total = model.itemsPerPage * 4
+        model.search(page: 2)
+        try await waitUntil("displayed query page two") { probe.replies.count == 1 }
+        probe.replies[0].resume(returning: ([item], total))
+        try await waitUntil("displayed query ready") { !model.isLoading }
+        model.searchText = "Failing query"
+        model.submitSearch()
+        try await waitUntil("different query request") { probe.replies.count == 2 }
+        probe.replies[1].resume(throwing: failure)
+        try await waitUntil("different query failure") { !model.isLoading }
+        model.searchText = ""
+        model.retrySearch()
+        try await waitUntil("retry reverted criteria") { probe.replies.count == 3 }
+        let revertedPage = probe.pages.last
+        probe.replies[2].resume(returning: ([item], total))
+        try await waitUntil("reverted criteria completion") { !model.isLoading }
+        try require(revertedPage == 1 && model.currentPage == 1,
+                    "Reverting to displayed criteria reused its old page instead of restarting at one")
+
+        model.searchText = "Empty query"
+        model.submitSearch()
+        try await waitUntil("pending empty query") { probe.replies.count == 4 }
+        model.goToPage(2)
+        try await waitUntil("empty query page two") { probe.replies.count == 5 }
+        probe.replies[4].resume(returning: ([], 0))
+        try await waitUntil("empty query normalization") { !model.isLoading }
+        try require(model.currentPage == 1 && model.loadedPage == 1 && model.totalPages == 1 &&
+                    model.items.isEmpty && model.requestedPage == nil,
+                    "Empty new-query results committed an out-of-range page")
+        probe.replies[3].resume(returning: ([item], total))
+        try await Task.sleep(for: .milliseconds(30))
+        try require(model.items.isEmpty && model.totalItems == 0, "Stale first-page response replaced empty results")
+
+        model.searchText = "Large query"
+        model.submitSearch()
+        try await waitUntil("restore large range") { probe.replies.count == 6 }
+        probe.replies[5].resume(returning: ([item], total))
+        try await waitUntil("large range ready") { !model.isLoading }
+        let retainedRevision = model.pageLoadRevision
+        model.searchText = "Smaller query"
+        model.submitSearch()
+        try await waitUntil("smaller query pending") { probe.replies.count == 7 }
+        model.goToPage(4)
+        try await waitUntil("smaller query old page range") { probe.replies.count == 8 }
+        // Even a nonempty out-of-range response must not simply be relabeled.
+        probe.replies[7].resume(returning: ([item], model.itemsPerPage * 2))
+        try await waitUntil("corrective page request") { probe.replies.count == 9 }
+        try require(probe.pages.last == 2 && model.requestedPage == 2 && model.isLoading &&
+                    model.currentPage == 1 && model.items.map(\.id) == [item.id] &&
+                    model.pageLoadRevision == retainedRevision && model.totalItems == total,
+                    "Out-of-range content was committed before fetching the valid page")
+        probe.replies[8].resume(throwing: failure)
+        try await waitUntil("corrective request failure") { !model.isLoading }
+        try require(model.currentPage == 1 && model.pageLoadRevision == retainedRevision &&
+                    model.pageNavigationMessage != nil, "Correction failure discarded the previous results")
+        model.retrySearch()
+        try await waitUntil("retry corrective page") { probe.replies.count == 10 }
+        try require(probe.pages.last == 2, "Correction retry used the original invalid page")
+        probe.replies[9].resume(returning: ([correctedItem], model.itemsPerPage * 2))
+        try await waitUntil("corrective result committed") { !model.isLoading }
+        try require(model.currentPage == 2 && model.loadedPage == 2 && model.totalPages == 2 &&
+                    model.items.map(\.id) == [correctedItem.id] && model.pageLoadRevision == retainedRevision + 1,
+                    "Corrected content and page were not committed together")
+        probe.replies[6].resume(returning: ([item], total))
+        try await Task.sleep(for: .milliseconds(30))
+        try require(model.items.map(\.id) == [correctedItem.id], "Stale initial search replaced corrected results")
+
+        model.searchText = "One-page query"
+        model.submitSearch()
+        try await waitUntil("one-page query pending") { probe.replies.count == 11 }
+        model.goToPage(2)
+        try await waitUntil("one-page query invalid target") { probe.replies.count == 12 }
+        probe.replies[11].resume(returning: ([], 1))
+        try await waitUntil("one-page corrective request") { probe.replies.count == 13 }
+        try require(probe.pages.last == 1 && model.requestedPage == 1, "Empty invalid page did not request valid content")
+        model.searchText = "Latest query"
+        model.submitSearch()
+        try await waitUntil("supersede corrective request") { probe.replies.count == 14 }
+        probe.replies[12].resume(returning: ([item], 1))
+        probe.replies[10].resume(throwing: failure)
+        try await Task.sleep(for: .milliseconds(30))
+        try require(model.isLoading && model.items.map(\.id) == [correctedItem.id] && model.error == nil,
+                    "A superseded correction changed content or loading state")
+        probe.replies[13].resume(returning: ([], 0))
+        try await waitUntil("latest query after correction") { !model.isLoading }
+        try require(model.currentPage == 1 && model.items.isEmpty && model.totalItems == 0,
+                    "Latest query failed to replace the corrective request")
+        print("PASS: reverted-criteria retry, empty-result normalization, corrective fetch/failure/retry and supersession")
     }
 
     static func testObservation() throws {

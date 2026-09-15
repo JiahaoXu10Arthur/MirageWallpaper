@@ -699,80 +699,97 @@ class WorkshopViewModel {
 
         searchTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            var responsePage = requestPage
             do {
-                let result: (items: [WorkshopItem], total: Int)
-                var matchedCreator: WorkshopCreator?
-                if let pageSearch = self.pageSearch {
-                    result = try await pageSearch(requestPage)
-                } else if Self.isPublishedFileId(criteria.text) {
-                    let details = try await SteamWebAPI.shared.getFileDetails(workshopIds: [criteria.text])
-                    let items = details.filter {
-                        $0.publishedFileId == criteria.text &&
-                            $0.consumerAppId == 431960 &&
-                            criteria.showOnly.matches(
-                                workshopItem: $0,
-                                favoriteIDs: criteria.favorites
-                            )
+                while true {
+                    let result: (items: [WorkshopItem], total: Int)
+                    var matchedCreator: WorkshopCreator?
+                    if let pageSearch = self.pageSearch {
+                        result = try await pageSearch(responsePage)
+                    } else if Self.isPublishedFileId(criteria.text) {
+                        let details = try await SteamWebAPI.shared.getFileDetails(workshopIds: [criteria.text])
+                        let items = details.filter {
+                            $0.publishedFileId == criteria.text &&
+                                $0.consumerAppId == 431960 &&
+                                criteria.showOnly.matches(
+                                    workshopItem: $0,
+                                    favoriteIDs: criteria.favorites
+                                )
+                        }
+                        result = (items, items.count)
+                    } else if Self.isSteamUserId(criteria.text) {
+                        matchedCreator = await SteamWebAPI.shared.creatorProfile(steamId: criteria.text)
+                        result = ([], 0)
+                    } else {
+                        result = try await SteamWebAPI.shared.queryFiles(
+                            searchText: criteria.text,
+                            tags: Array(criteria.tags),
+                            sortOrder: criteria.sort,
+                            typeFilters: criteria.types,
+                            ageRating: criteria.ageRating,
+                            widescreenResolution: criteria.widescreen,
+                            ultraWidescreenResolution: criteria.ultraWidescreen,
+                            dualscreenResolution: criteria.dualscreen,
+                            triplescreenResolution: criteria.triplescreen,
+                            portraitResolution: criteria.portrait,
+                            miscResolution: criteria.misc,
+                            showOnly: criteria.showOnly,
+                            favoriteIDs: criteria.favorites,
+                            page: responsePage,
+                            perPage: self.itemsPerPage,
+                            trendDays: criteria.sort.usesTrendPeriod ? criteria.trendPeriod.rawValue : nil
+                        )
                     }
-                    result = (items, items.count)
-                } else if Self.isSteamUserId(criteria.text) {
-                    matchedCreator = await SteamWebAPI.shared.creatorProfile(steamId: criteria.text)
-                    result = ([], 0)
-                } else {
-                    result = try await SteamWebAPI.shared.queryFiles(
-                        searchText: criteria.text,
-                        tags: Array(criteria.tags),
-                        sortOrder: criteria.sort,
-                        typeFilters: criteria.types,
-                        ageRating: criteria.ageRating,
-                        widescreenResolution: criteria.widescreen,
-                        ultraWidescreenResolution: criteria.ultraWidescreen,
-                        dualscreenResolution: criteria.dualscreen,
-                        triplescreenResolution: criteria.triplescreen,
-                        portraitResolution: criteria.portrait,
-                        miscResolution: criteria.misc,
-                        showOnly: criteria.showOnly,
-                        favoriteIDs: criteria.favorites,
-                        page: requestPage,
-                        perPage: self.itemsPerPage,
-                        trendDays: criteria.sort.usesTrendPeriod ? criteria.trendPeriod.rawValue : nil
-                    )
-                }
 
-                guard !Task.isCancelled, generation == self.searchGeneration else { return }
-                if criteria == self.displayedSearchCriteria, (page != nil || requestPage > 1),
-                   result.items.isEmpty, !self.items.isEmpty {
-                    let retainedPage = self.loadedPage
-                    self.pageNavigationMessage = L(
-                        "Steam 没有返回第 %d 页，已保留第 %d 页。",
-                        requestPage,
-                        retainedPage
-                    )
+                    guard !Task.isCancelled, generation == self.searchGeneration else { return }
+                    if criteria == self.displayedSearchCriteria, (page != nil || responsePage > 1),
+                       result.items.isEmpty, !self.items.isEmpty {
+                        let retainedPage = self.loadedPage
+                        self.pageNavigationMessage = L(
+                            "Steam 没有返回第 %d 页，已保留第 %d 页。",
+                            responsePage,
+                            retainedPage
+                        )
+                        self.isLoading = false
+                        self.requestedPage = nil
+                        self.requestedSearchCriteria = nil
+                        self.failedSearch = (criteria, responsePage)
+                        self.steamServiceStatus.browsingAPI = .available(L("Steam Web API 可用"))
+                        return
+                    }
+                    let returnedPageCount = min(self.maximumPages,
+                        max(1, Int(ceil(Double(result.total) / Double(self.itemsPerPage)))))
+                    if responsePage > returnedPageCount {
+                        if result.items.isEmpty && result.total == 0 {
+                            responsePage = 1
+                        } else {
+                            // Fetch the valid page instead of relabeling this response's content.
+                            // Keep the captured criteria and generation across the correction.
+                            responsePage = returnedPageCount
+                            self.requestedPage = responsePage
+                            continue
+                        }
+                    }
+                    self.items = result.items
+                    self.totalItems = result.total
+                    self.currentPage = responsePage
+                    self.loadedPage = responsePage
+                    self.displayedSearchCriteria = criteria
+                    self.pageLoadRevision &+= 1
+                    self.rememberCreators(in: result.items)
+                    self.refreshSubscriptionStates(for: result.items)
+                    if let matchedCreator {
+                        self.rememberCreator(matchedCreator)
+                    }
                     self.isLoading = false
                     self.requestedPage = nil
                     self.requestedSearchCriteria = nil
-                    self.failedSearch = (criteria, requestPage)
                     self.steamServiceStatus.browsingAPI = .available(L("Steam Web API 可用"))
                     return
                 }
-                self.items = result.items
-                self.totalItems = result.total
-                self.currentPage = requestPage
-                self.loadedPage = requestPage
-                self.displayedSearchCriteria = criteria
-                self.pageLoadRevision &+= 1
-                self.rememberCreators(in: result.items)
-                self.refreshSubscriptionStates(for: result.items)
-                if let matchedCreator {
-                    self.rememberCreator(matchedCreator)
-                }
-                self.isLoading = false
-                self.requestedPage = nil
-                self.requestedSearchCriteria = nil
-                self.steamServiceStatus.browsingAPI = .available(L("Steam Web API 可用"))
             } catch {
                 guard !Task.isCancelled, generation == self.searchGeneration else { return }
-                self.finishSearchFailure(error.localizedDescription, criteria: criteria, page: requestPage)
+                self.finishSearchFailure(error.localizedDescription, criteria: criteria, page: responsePage)
                 self.steamServiceStatus.browsingAPI = .unavailable(error.localizedDescription)
             }
         }
@@ -792,7 +809,7 @@ class WorkshopViewModel {
     }
 
     func retrySearch() {
-        let page = failedSearch.flatMap { $0.criteria == currentSearchCriteria ? $0.page : nil }
+        let page = failedSearch.map { $0.criteria == currentSearchCriteria ? $0.page : 1 }
         search(page: page)
     }
 

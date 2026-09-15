@@ -45,11 +45,11 @@ struct PageNavigator: View {
                         select(page)
                     } label: {
                         Text("\(page)")
-                            .font(.callout.weight(page == currentPage ? .semibold : .regular))
-                            .foregroundStyle(page == currentPage ? Color.white : Color.primary)
+                            .font(.callout.weight(page == navigationPage ? .semibold : .regular))
+                            .foregroundStyle(page == navigationPage ? Color.white : Color.primary)
                             .frame(minWidth: 30, minHeight: 30)
                             .background(
-                                page == currentPage ? Color.accentColor : Color.clear,
+                                page == navigationPage ? Color.accentColor : Color.clear,
                                 in: RoundedRectangle(cornerRadius: 6, style: .continuous)
                             )
                             .contentShape(Rectangle())
