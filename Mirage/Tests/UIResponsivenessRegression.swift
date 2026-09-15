@@ -341,6 +341,47 @@ private struct UIResponsivenessRegression {
         print("PASS: stable UUID persistence and reordered temporary stops preserve display identity")
     }
 
+    static func testStoppedReconnectIdentities(_ first: WEWallpaper, _ second: WEWallpaper) async throws {
+        let otherKey = DisplayKey(rawValue: "uuid:99999999-9999-9999-9999-999999999992")
+        func info(_ key: DisplayKey, _ id: CGDirectDisplayID, _ index: Int) -> DisplayInfo {
+            DisplayInfo(key: key, displayID: id, index: index, name: "Reconnect identity",
+                        size: CGSize(width: 1920, height: 1080), isMain: index == 0)
+        }
+        let other = info(otherKey, 9702, 1)
+        for (rawKey, retainsStop) in [("uuid:99999999-9999-9999-9999-999999999991", true),
+                                      ("idx:0", false), ("vms:1:2:3:0", false)] {
+            let key = DisplayKey(rawValue: rawKey)
+            let display = info(key, 9701, 0)
+            let suite = "mirage-stop-reconnect-\(UUID())"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let model = WallpaperViewModel(initialStates: [
+                key: DisplayWallpaperState(wallpaper: first, runtime: .init()),
+                otherKey: DisplayWallpaperState(wallpaper: second, runtime: .init())
+            ], stoppedDisplayDefaults: defaults, connectedDisplays: [display, other])
+            defer { model.renderer.stopAllAndWait() }
+            model.selectedDisplayKey = key
+            model.stopWallpaper()
+            try require(defaults.stringArray(forKey: "ManuallyStoppedDisplays") == (retainsStop ? [rawKey] : []),
+                        "Reconnect fixture did not persist the expected identity type")
+            model.reconcileDisplays([other])
+            model.reconcileDisplays([display, other])
+            if retainsStop {
+                try require(model.state(for: key) == nil && model.manuallyStoppedDisplays.contains(key) &&
+                            !model.renderer.hasCoverageOrWork(onDisplay: display.displayID),
+                            "Stable UUID lost its stop or restarted on reconnect")
+            } else {
+                try await waitUntil("temporary identity reconnect inherits") {
+                    model.state(for: key)?.wallpaper.id == second.id &&
+                    model.renderer.isRendering(onDisplay: display.displayID)
+                }
+                try require(!model.manuallyStoppedDisplays.contains(key),
+                            "Temporary identity retained a stop after disconnect")
+            }
+        }
+        print("PASS: UUID reconnect retains stops; positional and framebuffer reconnects inherit rendering")
+    }
+
     static func testAmbiguousStoppedAssignments(_ first: WEWallpaper, _ second: WEWallpaper) throws {
         let key = DisplayKey(rawValue: "uuid:77777777-7777-7777-7777-777777777777")
         let duplicate = DisplayKey(rawValue: key.rawValue + "#1")
@@ -499,6 +540,7 @@ private struct UIResponsivenessRegression {
         try testAmbiguousStoppedAssignments(first, second)
         try await testDisplayIDReuse(display, first, second)
         try await testManualStopTopology(first, second)
+        try await testStoppedReconnectIdentities(first, second)
         try await testStopRekeyCancellation(display, first)
         let failure = try wallpaper("fail-activate-stopped")
         let slow = try wallpaper("slow-activate-stopped")
@@ -540,15 +582,16 @@ private struct UIResponsivenessRegression {
                     "Late playlist assignment restarted a stopped display")
         model.reconcileDisplays([display, other, fresh])
         try await waitUntil("new display inheritance") {
-            model.state(for: fresh.key)?.wallpaper.id == second.id && model.renderer.isRendering(onDisplay: 9002)
+            model.state(for: fresh.key)?.wallpaper.id == second.id &&
+            model.renderer.isRendering(onDisplay: fresh.displayID)
         }
         try require(model.state(for: display.key) == nil &&
                     !model.renderer.hasCoverageOrWork(onDisplay: display.displayID),
                     "Topology reconciliation restarted the stopped display")
-        model.reconcileDisplays([other])
+        // Reconnect persistence is covered with explicit UUID/idx/vms fixtures
+        // above; this real display may legitimately have a temporary identity.
+        // Keep fresh's saved state after disconnect for the stop-all check below.
         model.reconcileDisplays([display, other])
-        try require(model.state(for: display.key) == nil && model.manuallyStoppedDisplays.contains(display.key),
-                    "Disconnect/reconnect lost the stop marker")
         let reloaded = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults,
                                                  connectedDisplays: [display, other])
         defer { reloaded.renderer.stopAllAndWait() }
