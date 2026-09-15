@@ -134,6 +134,11 @@ private struct UIResponsivenessRegression {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             NSApplication.shared.setActivationPolicy(.accessory)
             NSApplication.shared.finishLaunching()
+            if CommandLine.arguments.contains("--stopped-displays") {
+                try await testStoppedDisplays()
+                print("StoppedDisplaysRegression: all checks passed")
+                return
+            }
             if CommandLine.arguments.contains("--playback-policy") {
                 try testPlaybackPolicyEvaluation()
                 try testPlaybackPolicyInputs()
@@ -174,6 +179,107 @@ private struct UIResponsivenessRegression {
             fputs("UIResponsivenessRegression: \(error)\n", stderr)
             exit(1)
         }
+    }
+
+    static func testStoppedDisplays() async throws {
+        guard let display = DisplayRegistry.shared.connected.first else {
+            throw RegressionFailure(description: "A display is required for stopped-display regression")
+        }
+        let rendererDirectory = Bundle.main.resourceURL!.appending(path: "Renderers")
+        try FileManager.default.createDirectory(at: rendererDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: rendererDirectory.appending(path: "VideoWallpaper"),
+                                                  withDestinationURL: Bundle.main.executableURL!)
+        let suite = "mirage-stopped-test-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let first = try wallpaper("stopped-first")
+        let second = try wallpaper("stopped-second")
+        let failure = try wallpaper("fail-activate-stopped")
+        let slow = try wallpaper("slow-activate-stopped")
+        let other = DisplayInfo(key: DisplayKey(rawValue: "test:other"), displayID: 9002,
+                                index: 1, name: "Other", size: CGSize(width: 1920, height: 1080), isMain: false)
+        let fresh = DisplayInfo(key: DisplayKey(rawValue: "test:new"), displayID: 9003,
+                                index: 2, name: "New", size: CGSize(width: 1920, height: 1080), isMain: false)
+        let initial = [display.key: DisplayWallpaperState(wallpaper: first, runtime: .init()),
+                       other.key: DisplayWallpaperState(wallpaper: second, runtime: .init())]
+        let model = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        defer { model.renderer.stopAllAndWait() }
+        model.selectedDisplayKey = display.key
+        model.stopWallpaper()
+        model.selectedDisplayKey = other.key
+        try require(model.manuallyStoppedDisplays.contains(display.key), "Manual stop was not recorded")
+        try require(!model.allowsPlaylistAdvance(on: display.key, manually: false, updateOnPause: true),
+                    "A stopped display permits automatic playlist advancement")
+        var lateResult: Bool?
+        model.assign(first, to: display.key, preservingPlaybackState: true) { lateResult = $0 }
+        try require(lateResult == false && model.state(for: display.key) == nil,
+                    "Late playlist assignment restarted a stopped display")
+        model.reconcileDisplays([display, other, fresh])
+        try await waitUntil("new display inheritance") {
+            model.state(for: fresh.key)?.wallpaper.id == second.id && model.renderer.isRendering(onDisplay: 9002)
+        }
+        try require(model.state(for: display.key) == nil &&
+                    !model.renderer.hasCoverageOrWork(onDisplay: display.displayID),
+                    "Topology reconciliation restarted the stopped display")
+        model.reconcileDisplays([other])
+        model.reconcileDisplays([display, other])
+        try require(model.state(for: display.key) == nil && model.manuallyStoppedDisplays.contains(display.key),
+                    "Disconnect/reconnect lost the stop marker")
+        let reloaded = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        defer { reloaded.renderer.stopAllAndWait() }
+        try require(reloaded.state(for: display.key) == nil && reloaded.state(for: other.key) != nil,
+                    "Relaunch restored a stale assignment over the persisted manual stop")
+
+        var cancelledResult: Bool?
+        model.assign(slow, to: display.key) { cancelledResult = $0 }
+        try await waitUntil("pending explicit assignment") {
+            model.renderer.hasCoverageOrWork(onDisplay: display.displayID)
+        }
+        model.clear(display.key)
+        try await waitUntil("stopped in-flight assignment completion") { cancelledResult != nil }
+        try require(cancelledResult == false && model.state(for: display.key) == nil &&
+                    model.manuallyStoppedDisplays.contains(display.key), "Late completion undid a manual stop")
+        try await waitUntil("stopped candidate exit") {
+            !model.renderer.hasCoverageOrWork(onDisplay: display.displayID)
+        }
+        let cancelledReload = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        defer { cancelledReload.renderer.stopAllAndWait() }
+        try require(cancelledReload.state(for: display.key) == nil, "Cancelled assignment cleared persisted stop")
+
+        var policyResult: Bool?
+        model.assign(slow, to: display.key) { policyResult = $0 }
+        model.applyPlaybackPolicy(.stop)
+        try require(policyResult == true && !model.manuallyStoppedDisplays.contains(display.key) &&
+                    model.state(for: display.key)?.wallpaper.id == slow.id,
+                    "Policy stop accepted an explicit assignment without clearing the manual stop")
+        let policyReload = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        defer { policyReload.renderer.stopAllAndWait() }
+        try require(policyReload.state(for: display.key) != nil, "Policy commit did not persist the cleared stop")
+        model.clear(display.key)
+
+        let failed: Bool = await withCheckedContinuation { continuation in
+            model.assign(failure, to: display.key) { continuation.resume(returning: $0) }
+        }
+        try require(!failed && model.manuallyStoppedDisplays.contains(display.key) && model.state(for: display.key) == nil,
+                    "Failed explicit assignment cleared the manual stop")
+        let applied: Bool = await withCheckedContinuation { continuation in
+            model.assign(first, to: display.key) { continuation.resume(returning: $0) }
+        }
+        try require(applied && !model.manuallyStoppedDisplays.contains(display.key),
+                    "Successful explicit assignment did not resume display management")
+        let resumed = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        defer { resumed.renderer.stopAllAndWait() }
+        try require(resumed.state(for: display.key) != nil, "Successful assignment did not persist the cleared stop")
+        model.applyPlaybackPolicy(.stop)
+        try require(!model.manuallyStoppedDisplays.contains(display.key) && model.state(for: display.key) != nil,
+                    "Temporary playback-policy stop was made permanent")
+        model.stopAllWallpapers()
+        try require(model.manuallyStoppedDisplays.isSuperset(of: [display.key, other.key, fresh.key]),
+                    "Stop all omitted a connected or disconnected saved display")
+        let stoppedAll = WallpaperViewModel(initialStates: initial, stoppedDisplayDefaults: defaults)
+        defer { stoppedAll.renderer.stopAllAndWait() }
+        try require(stoppedAll.displayStates.isEmpty, "Stop all did not survive reload")
+        print("PASS: manual stop, inherited displays, reconnect, persistence, failed/successful resume, playlist and policy boundaries")
     }
 
     static func testPlaybackPolicyEvaluation() throws {
@@ -1217,6 +1323,7 @@ private struct UIResponsivenessRegression {
             }
             switch command["cmd"] as? String {
             case "activate":
+                if CommandLine.arguments.dropFirst().first?.contains("slow-activate") == true { usleep(300_000) }
                 activated = true
                 emit(fails ? "activation-failed" : "activated")
                 if !fails { emit("position-availability", ["x": true, "y": false]) }

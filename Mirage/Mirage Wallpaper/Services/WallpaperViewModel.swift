@@ -94,6 +94,9 @@ class WallpaperViewModel: PlaylistPlayback {
     }
 
     private static let assignmentsDefaultsKey = "DisplayAssignments"
+    private static let stoppedDisplaysDefaultsKey = "ManuallyStoppedDisplays"
+    @ObservationIgnored private let stoppedDisplayDefaults: UserDefaults?
+    private(set) var manuallyStoppedDisplays: Set<DisplayKey> = []
     private static let selectedDisplayDefaultsKey = "SelectedDisplay"
     private static let legacyWallpaperDefaultsKey = "CurrentWallpaper"
     private static let runtimeKeyPrefix = "Runtime_"
@@ -161,8 +164,13 @@ class WallpaperViewModel: PlaylistPlayback {
                         ?? URL(fileURLWithPath: "/dev/null"))
     }
 
-    init(initialStates: [DisplayKey: DisplayWallpaperState]? = nil) {
+    init(initialStates: [DisplayKey: DisplayWallpaperState]? = nil,
+         stoppedDisplayDefaults: UserDefaults? = nil) {
         persistsChanges = initialStates == nil
+        let stopDefaults = stoppedDisplayDefaults ?? (initialStates == nil ? .standard : nil)
+        self.stoppedDisplayDefaults = stopDefaults
+        manuallyStoppedDisplays = Set((stopDefaults?.stringArray(
+            forKey: Self.stoppedDisplaysDefaultsKey) ?? []).map(DisplayKey.init(rawValue:)))
         let registry = DisplayRegistry.shared
         let stored = UserDefaults.standard.string(forKey: Self.selectedDisplayDefaultsKey)
             .map(DisplayKey.init(rawValue:))
@@ -189,6 +197,8 @@ class WallpaperViewModel: PlaylistPlayback {
                 loaded[key] = repaired
             }
         }
+        // A manual stop wins over an older assignment or legacy migration.
+        loaded = loaded.filter { !manuallyStoppedDisplays.contains($0.key) }
         displayStates = loaded
         refreshSelectedState()
         displayStatesChanges.send(loaded)
@@ -498,6 +508,11 @@ class WallpaperViewModel: PlaylistPlayback {
 
     func assign(_ wallpaper: WEWallpaper, to key: DisplayKey, restoreFocus: Bool = false,
                 preservingPlaybackState: Bool = false, completion: ((Bool) -> Void)? = nil) {
+        // Playlist work can finish preparing after the user stops this display.
+        guard !preservingPlaybackState || !manuallyStoppedDisplays.contains(key) else {
+            completion?(false)
+            return
+        }
         if !preservingPlaybackState { wallpaperChangeRequests.send(key) }
         let completion = completion.map(AssignmentCompletion.init)
         pendingPreparations[key] = nil
@@ -637,6 +652,7 @@ class WallpaperViewModel: PlaylistPlayback {
             cancelRuntimeSave(for: key)
             persistRuntime(previous.runtime, for: previous.wallpaper, on: key)
         }
+        manuallyStoppedDisplays.remove(key)
         displayStates[key] = state
         cancelFailedAssignmentRecovery(for: key)
         committedAssignmentIDs[key] = assignmentID
@@ -689,6 +705,7 @@ class WallpaperViewModel: PlaylistPlayback {
     }
 
     func clear(_ key: DisplayKey) {
+        manuallyStoppedDisplays.insert(key)
         previewSelections[key] = nil
         wallpaperChangeRequests.send(key)
         pendingPreparations[key] = nil
@@ -720,6 +737,8 @@ class WallpaperViewModel: PlaylistPlayback {
     }
 
     func stopAllWallpapers() {
+        manuallyStoppedDisplays.formUnion(displayStates.keys)
+        manuallyStoppedDisplays.formUnion(DisplayRegistry.shared.connectedKeys)
         previewSelections.removeAll()
         for info in DisplayRegistry.shared.connected { wallpaperChangeRequests.send(info.key) }
         pendingPreparations.removeAll()
@@ -948,7 +967,10 @@ class WallpaperViewModel: PlaylistPlayback {
 
     @objc private func displayTopologyChanged() {
         DisplayRegistry.shared.invalidate()
-        let connected = DisplayRegistry.shared.connected
+        reconcileDisplays(DisplayRegistry.shared.connected)
+    }
+
+    func reconcileDisplays(_ connected: [DisplayInfo]) {
         let connectedIDs = Set(connected.map(\.displayID))
         let connectedKeys = Set(connected.map(\.key))
 
@@ -976,6 +998,7 @@ class WallpaperViewModel: PlaylistPlayback {
             ?? displayStates[selectedDisplayKey]
         var seeded = false
         for info in connected {
+            if manuallyStoppedDisplays.contains(info.key) { continue }
             if hasPendingAssignment(on: info.displayID, for: info.key) { continue }
             if displayStates[info.key] == nil, let inherited {
                 if currentPlaybackPolicy(for: info.key) == .stop {
@@ -1199,6 +1222,8 @@ class WallpaperViewModel: PlaylistPlayback {
     }
 
     private func persistStates() {
+        stoppedDisplayDefaults?.set(manuallyStoppedDisplays.map(\.rawValue).sorted(),
+                                   forKey: Self.stoppedDisplaysDefaultsKey)
         guard persistsChanges else { return }
         statesSaveWorkItem?.cancel()
         statesSaveWorkItem = nil
@@ -1649,7 +1674,8 @@ class WallpaperViewModel: PlaylistPlayback {
     }
 
     func allowsPlaylistAdvance(on key: DisplayKey, manually: Bool, updateOnPause: Bool) -> Bool {
-        guard DisplayRegistry.shared.info(for: key) != nil else { return false }
+        guard !manuallyStoppedDisplays.contains(key),
+              DisplayRegistry.shared.info(for: key) != nil else { return false }
         let policy = currentPlaybackPolicy(for: key)
         guard policy != .stop else { return false }
         return manually || updateOnPause || !isPaused(runtime(for: key), action: policy)
@@ -1701,6 +1727,7 @@ class WallpaperViewModel: PlaylistPlayback {
             cancelRuntimeSave(for: proposal.key)
             persistRuntime(previous.runtime, for: previous.wallpaper, on: key)
         }
+        manuallyStoppedDisplays.remove(proposal.key)
         displayStates[proposal.key] = committed
         committedAssignmentIDs[proposal.key] = proposal.id
         finishPreview(for: proposal.key, id: proposal.id)
