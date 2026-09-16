@@ -249,10 +249,19 @@ struct ExplorerItemMenu: SubviewOfContentView {
 
     private func setAsScreenSaver() {
         let wallpaper = hoveredWallpaper
+        let requestedAt = ProcessInfo.processInfo.systemUptime
+        Task { @MainActor in
+            await wallpaperViewModel.refreshScriptStorage(for: wallpaper)
+            configureScreenSaver(wallpaper, requestedAt: requestedAt)
+        }
+    }
+
+    private func configureScreenSaver(_ wallpaper: WEWallpaper, requestedAt: TimeInterval) {
         let runtime = wallpaperViewModel.loadRuntime(for: wallpaper)
         let properties = wallpaperViewModel.effectiveProperties(for: wallpaper, runtime: runtime)
         let fps = Int(AppDelegate.shared.globalSettingsViewModel.settings.fps)
-        let context = ScreenSaverManager.ConfigurationContext(wallpaperID: wallpaper.id, runtime: runtime, fps: fps)
+        var context = ScreenSaverManager.ConfigurationContext(wallpaperID: wallpaper.id, runtime: runtime, fps: fps)
+        context.capturedAt = requestedAt
         let manager = ScreenSaverManager.shared
         let needsInstallation = !manager.isInstalled
 
@@ -270,11 +279,13 @@ struct ExplorerItemMenu: SubviewOfContentView {
             DispatchQueue.main.async {
                 switch result {
                 case .success:
+                    wallpaperViewModel.saveRuntime()
                     viewModel.screenSaverFeedback = ScreenSaverFeedback(
                         title: "已设为屏保",
                         message: "“\(wallpaper.project.title)”将在下次启动屏保时显示。"
                     )
                 case .failure(let error):
+                    guard !(error is CancellationError) else { return }
                     viewModel.screenSaverFeedback = ScreenSaverFeedback(
                         title: "设置屏保失败",
                         message: error.localizedDescription

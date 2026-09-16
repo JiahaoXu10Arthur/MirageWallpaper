@@ -13,7 +13,7 @@ import Foundation
 import ImageIO
 
 private final class MirageSceneLibrary {
-    typealias Create = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafePointer<CChar>?, UnsafePointer<CChar>?, UInt32, UInt32, UInt32, UnsafePointer<CChar>?, Double, Double) -> UnsafeMutableRawPointer?
+    typealias Create = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafePointer<CChar>?, UnsafePointer<CChar>?, UInt32, UInt32, UInt32, UnsafePointer<CChar>?, Double, Double, UnsafePointer<CChar>?) -> UnsafeMutableRawPointer?
     typealias SetPaused = @convention(c) (UnsafeMutableRawPointer?, Int32) -> Void
     typealias FirstFrameCallback = @convention(c) (UnsafeMutableRawPointer?) -> Void
     typealias SetFirstFrame = @convention(c) (UnsafeMutableRawPointer?, FirstFrameCallback?, UnsafeMutableRawPointer?) -> Void
@@ -32,7 +32,7 @@ private final class MirageSceneLibrary {
         ].compactMap { $0 }
         for url in candidates where FileManager.default.fileExists(atPath: url.path) {
             guard let handle = dlopen(url.path, RTLD_NOW | RTLD_LOCAL),
-                  let create = dlsym(handle, "MirageSceneDesktopCreateWithPosition"),
+                  let create = dlsym(handle, "MirageSceneDesktopCreateWithRuntime"),
                   let pause = dlsym(handle, "MirageSceneDesktopSetPaused"),
                   let firstFrame = dlsym(handle, "MirageSceneDesktopSetFirstFrameCallback"),
                   let destroy = dlsym(handle, "MirageSceneDesktopDestroy") else { continue }
@@ -50,6 +50,8 @@ private final class MirageSceneLibrary {
 }
 
 final class MirageLockRenderer {
+    let instanceID: UUID
+    private var previousRenderer: MirageLockRenderer?
     private let rootLayer: CALayer
     private let configuration: MirageLockDisplayConfiguration
     private let renderSize: CGSize
@@ -66,6 +68,11 @@ final class MirageLockRenderer {
     private var videoReady = false
     private var sceneReady = false
     private var isPaused = false
+    private var hasStartedRendering = false
+
+    func matches(_ value: MirageLockDisplayConfiguration, enabled: Bool) -> Bool {
+        dynamicEnabled == enabled && configuration.renderIdentity == value.renderIdentity
+    }
     private var isLocked: Bool
     private let dynamicEnabled: Bool
     private let isVideo: Bool
@@ -75,8 +82,22 @@ final class MirageLockRenderer {
 
     init(rootLayer: CALayer, size: CGSize, scale: CGFloat,
          configuration: MirageLockDisplayConfiguration, locked: Bool,
-         dynamicEnabled: Bool, onStateChange: @escaping (String?) -> Void = { _ in }) {
-        self.rootLayer = rootLayer
+         dynamicEnabled: Bool, prepareImmediately: Bool = true,
+         replacing previous: MirageLockRenderer? = nil, instanceID: UUID = UUID(),
+         onStateChange: @escaping (String?) -> Void = { _ in }) {
+        let contentLayer = CALayer()
+        self.rootLayer = contentLayer
+        self.instanceID = instanceID
+        if locked && dynamicEnabled {
+            previousRenderer = previous?.detachVisiblePredecessor()
+        } else {
+            previous?.stop()
+        }
+        contentLayer.opacity = previousRenderer == nil ? 1 : 0
+        contentLayer.frame = CGRect(origin: .zero, size: size)
+        contentLayer.contentsScale = scale
+        contentLayer.masksToBounds = true
+        rootLayer.addSublayer(contentLayer)
         self.configuration = configuration
         self.renderSize = size
         self.isLocked = locked && dynamicEnabled
@@ -86,15 +107,38 @@ final class MirageLockRenderer {
         rootLayer.frame = CGRect(origin: .zero, size: size)
         rootLayer.contentsScale = scale
         rootLayer.masksToBounds = true
-        if dynamicEnabled {
-            switch configuration.kind {
-            case "video": loadVideo(configuration)
-            case "scene": loadScene(configuration, size: size)
-            default: break
-            }
-        }
+        if dynamicEnabled && prepareImmediately { startRendering() }
         updateDesktopFallback(path: configuration.desktopFallbackPath)
         setLocked(locked && dynamicEnabled)
+    }
+
+    private func detachVisiblePredecessor() -> MirageLockRenderer {
+        if let previous = previousRenderer {
+            previousRenderer = nil
+            stop()
+            return previous.detachVisiblePredecessor()
+        }
+        pause()
+        return self
+    }
+
+    private func finishReplacement() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        rootLayer.opacity = 1
+        CATransaction.commit()
+        previousRenderer?.stop()
+        previousRenderer = nil
+    }
+
+    private func startRendering() {
+        guard !hasStartedRendering, dynamicEnabled else { return }
+        hasStartedRendering = true
+        switch configuration.kind {
+        case "video": loadVideo(configuration)
+        case "scene": loadScene(configuration, size: renderSize)
+        default: break
+        }
     }
 
     private func loadVideo(_ configuration: MirageLockDisplayConfiguration) {
@@ -162,7 +206,7 @@ final class MirageLockRenderer {
                     guard layer.isReadyForDisplay else { return }
                     DispatchQueue.main.async { self?.videoDidBecomeReady() }
                 }
-                if !self.isPaused { player.play() }
+                if !self.isPaused { player.playImmediately(atRate: configuration.playbackSpeed) }
             }
         }
     }
@@ -172,6 +216,7 @@ final class MirageLockRenderer {
         videoReady = true
         sceneReady = false
         updateDesktopLayerVisibility()
+        finishReplacement()
         onStateChange(nil)
     }
 
@@ -192,7 +237,11 @@ final class MirageLockRenderer {
         setenv("VK_ICD_FILENAMES", icdURL.path, 1)
         setenv("VK_DRIVER_FILES", icdURL.path, 1)
         let properties = configuration.rawProperties.mapValues { $0.foundationValue }
-        guard let data = try? JSONSerialization.data(withJSONObject: properties),
+        let runtimeData = try? JSONSerialization.data(withJSONObject: [
+            "speed": configuration.playbackSpeed, "scriptStorage": configuration.scriptStorage ?? [:]
+        ], options: .sortedKeys)
+        let runtimeJSON = runtimeData.flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        guard let data = try? JSONSerialization.data(withJSONObject: properties, options: .sortedKeys),
               let json = String(data: data, encoding: .utf8) else { return }
         let width = UInt32(max(1, min(size.width * rootLayer.contentsScale, 8192)))
         let height = UInt32(max(1, min(size.height * rootLayer.contentsScale, 8192)))
@@ -202,8 +251,10 @@ final class MirageLockRenderer {
             configuration.entryPath.withCString { pkg in
                 json.withCString { props in
                     configuration.fillMode.withCString { fill in
-                        library.create(pointer, assets, pkg, props, width, height,
-                                       UInt32(max(10, min(configuration.fps, 60))), fill, position.x, position.y)
+                        runtimeJSON.withCString { runtime in
+                            library.create(pointer, assets, pkg, props, width, height,
+                                           UInt32(max(10, min(configuration.fps, 60))), fill, position.x, position.y, runtime)
+                        }
                     }
                 }
             }
@@ -240,7 +291,7 @@ final class MirageLockRenderer {
 
     func resume() {
         isPaused = false
-        player?.play()
+        player?.playImmediately(atRate: configuration.playbackSpeed)
         if let sceneEngine { sceneLibrary?.setPaused(sceneEngine, 0) }
     }
 
@@ -248,9 +299,11 @@ final class MirageLockRenderer {
         let effectiveLocked = locked && dynamicEnabled
         isLocked = effectiveLocked
         if effectiveLocked {
+            startRendering()
             resume()
         } else {
             pause()
+            finishReplacement()
         }
         updateDesktopLayerVisibility()
     }
@@ -295,7 +348,7 @@ final class MirageLockRenderer {
     }
 
     func recoverAfterWake() {
-        guard dynamicEnabled else { return }
+        guard dynamicEnabled, hasStartedRendering else { return }
         enqueueDesktopFallback(path: desktopFallbackPath, force: true)
         if isVideo {
             resetVideoResources()
@@ -343,16 +396,20 @@ final class MirageLockRenderer {
             guard renderer.sceneEngine != nil else { return }
             renderer.sceneReady = true
             renderer.updateDesktopLayerVisibility()
+            renderer.finishReplacement()
             renderer.onStateChange(nil)
         }
     }
 
     func stop() {
+        previousRenderer?.stop()
+        previousRenderer = nil
         resetVideoResources()
         resetSceneResources()
         desktopLayer?.sampleBufferRenderer.flush()
         desktopLayer?.removeFromSuperlayer()
         desktopLayer = nil
+        rootLayer.removeFromSuperlayer()
     }
 
     private static func loadImage(_ path: String) -> CGImage? {

@@ -32,13 +32,16 @@ final class ScreenSaverManager {
     private let configurationDirectory: URL?
     private let configurationQueue = DispatchQueue(label: "cn.laobamac.Mirage.screensaver.configuration", qos: .utility)
 
-    struct ConfigurationContext {
+    struct ConfigurationContext: Sendable {
         let positions: [String: WallpaperPosition]
         let selectedPosition: WallpaperPosition
         let fps: Int
         let enableHDRVideo: Bool
         let loadFromMemory: Bool
         let language: String
+        var runtimeByDisplay: [String: WallpaperRenderSnapshot] = [:]
+        var sourceDisplayKey: String? = nil
+        var capturedAt = ProcessInfo.processInfo.systemUptime
 
         init(positions: [String: WallpaperPosition], selectedPosition: WallpaperPosition,
              fps: Int, enableHDRVideo: Bool, loadFromMemory: Bool, language: String) {
@@ -50,15 +53,18 @@ final class ScreenSaverManager {
             self.language = language
         }
 
-        init(wallpaperID: String, runtime: WallpaperRuntimeState, fps: Int) {
+        init(wallpaperID: String, runtime: WallpaperRuntimeState, fps: Int,
+             sourceDisplay: DisplayKey? = nil) {
             let model = AppDelegate.shared.wallpaperViewModel
             let settings = AppDelegate.shared.globalSettingsViewModel.settings
             let positions = model.positions(for: wallpaperID)
             self.init(positions: positions,
-                      selectedPosition: positions[model.selectedDisplayKey.rawValue] ?? runtime.position,
+                      selectedPosition: positions[(sourceDisplay ?? model.selectedDisplayKey).rawValue] ?? runtime.position,
                       fps: fps, enableHDRVideo: settings.shouldEnableHDRVideo,
                       loadFromMemory: (settings.wallpaperLoadSource ?? .disk) == .memory,
                       language: MirageLocalization.shared.locale.identifier)
+            sourceDisplayKey = (sourceDisplay ?? model.selectedDisplayKey).rawValue
+            runtimeByDisplay = model.renderSnapshots(for: wallpaperID)
         }
     }
     private let hostBundleIdentifiers = [
@@ -359,6 +365,12 @@ final class ScreenSaverManager {
                    context: ConfigurationContext? = nil) throws {
         let snapshot = context ?? ConfigurationContext(wallpaperID: wallpaper.id, runtime: runtime, fps: fps)
         try configurationQueue.sync {
+            let targetURL = forDynamicLockScreen ? dynamicLockScreenConfigurationURL : configurationURL
+            if let existing = supportedConfigurationObject(at: targetURL),
+               existing["configurationSession"] as? String == WallpaperRenderSnapshot.configurationSession,
+               let configuredAt = existing["configuredAt"] as? Double, configuredAt > snapshot.capturedAt {
+                throw CancellationError()
+            }
             try writeConfiguration(with: wallpaper, runtime: runtime, properties: properties,
                                    context: snapshot, forDynamicLockScreen: forDynamicLockScreen)
         }
@@ -376,15 +388,21 @@ final class ScreenSaverManager {
             let targets: [(Bool, [String: Any])] = [false, true].compactMap { dynamic in
                 let url = dynamic ? dynamicLockScreenConfigurationURL : configurationURL
                 guard let object = supportedConfigurationObject(at: url),
-                      object["wallpaperID"] as? String == wallpaper.id else { return nil }
+                      object["wallpaperID"] as? String == wallpaper.id,
+                      (object["configurationSession"] as? String != WallpaperRenderSnapshot.configurationSession ||
+                       (object["configuredAt"] as? Double ?? 0) <= context.capturedAt) else { return nil }
                 return (dynamic, object)
             }
             guard !targets.isEmpty else { return }
             let resolved = WallpaperViewModel.resolveProperties(properties, for: wallpaper)
             for (target, object) in targets {
-                try? writeConfiguration(with: wallpaper, runtime: runtime, properties: resolved,
-                                        context: context, forDynamicLockScreen: target,
-                                        preservingSettingsFrom: object)
+                do {
+                    try writeConfiguration(with: wallpaper, runtime: runtime, properties: resolved,
+                                           context: context, forDynamicLockScreen: target,
+                                           preservingSettingsFrom: object)
+                } catch {
+                    NSLog("[Mirage] Screen saver configuration update failed: %@", error.localizedDescription)
+                }
             }
         }
     }
@@ -406,48 +424,48 @@ final class ScreenSaverManager {
             throw MirageScreenSaverError.unsupportedWallpaper
         }
 
-        var rawPropertyValues: [String: Any] = [:]
-        for (key, property) in properties {
-            switch property.propertyType {
-            case .color:
-                rawPropertyValues[key] = ["type": "color", "value": property.value.stringValue]
-            case .bool:
-                rawPropertyValues[key] = property.value.boolValue
-            case .slider:
-                rawPropertyValues[key] = property.value.doubleValue
-            case .scenetexture, .file:
-                rawPropertyValues[key] = ["type": "scenetexture", "value": property.value.stringValue]
-            case .combo:
-                rawPropertyValues[key] = property.value.jsonObjectValue
-            case .usershortcut:
-                var value: [String: Any] = [
-                    "type": "usershortcut",
-                    "value": property.value.stringValue
-                ]
-                if let icon = property.mirageShortcutIcon { value["icon"] = icon }
-                rawPropertyValues[key] = value
-            default:
-                rawPropertyValues[key] = property.value.stringValue
-            }
+        let rawPropertyValues = WallpaperPropertyEncoding.values(properties)
+        let storedStorage = WallpaperRenderSnapshot.storedScriptStorage(for: wallpaper)
+        let sourceSnapshot = context.sourceDisplayKey.flatMap { context.runtimeByDisplay[$0] }
+        var runtimes = context.runtimeByDisplay
+        for key in runtimes.keys where runtimes[key]?.scriptStorage == nil {
+            runtimes[key]?.scriptStorage = storedStorage
         }
 
         var object: [String: Any] = [
             "version": 1,
+            "configuredAt": existing?["configuredAt"] ?? context.capturedAt,
+            "configurationSession": existing?["configurationSession"] ?? WallpaperRenderSnapshot.configurationSession,
             "wallpaperID": wallpaper.id,
             "title": wallpaper.project.title,
             "kind": wallpaper.kind.rawValue,
             "entryPath": wallpaper.resolvedEntryURL.path,
             "playableEntryPath": playableVideoCacheURL(for: wallpaper.resolvedEntryURL).path,
-            "rawProperties": rawPropertyValues,
+            "rawProperties": sourceSnapshot?.rawProperties.mapValues(\.foundationValue) ?? rawPropertyValues,
+            "speed": sourceSnapshot?.speed ?? (runtime.speed.isFinite && runtime.speed > 0 ? runtime.speed : 1),
+            "scriptStorage": sourceSnapshot?.scriptStorage ?? storedStorage,
+            "runtimeByDisplay": runtimes.mapValues(\.dictionary),
             "fps": min(max(context.fps, 10), 60),
-            "fillMode": runtime.fillMode.rawValue,
+            "fillMode": sourceSnapshot?.fillMode ?? runtime.fillMode.rawValue,
             "position": context.selectedPosition.dictionary,
             "positionsByDisplay": context.positions.mapValues(\.dictionary),
             "enableHDRVideo": context.enableHDRVideo,
             "loadFromMemory": context.loadFromMemory,
             "language": context.language
         ]
+        if let source = context.sourceDisplayKey { object["sourceDisplayKey"] = source }
         if let existing {
+            var savedRuntimes = existing["runtimeByDisplay"] as? [String: Any] ?? [:]
+            savedRuntimes.merge(runtimes.mapValues(\.dictionary)) { _, latest in latest }
+            object["runtimeByDisplay"] = savedRuntimes
+            if let source = existing["sourceDisplayKey"] as? String {
+                object["sourceDisplayKey"] = source
+                if source != context.sourceDisplayKey {
+                    for key in ["rawProperties", "fillMode", "position", "speed", "scriptStorage"] {
+                        object[key] = existing[key]
+                    }
+                }
+            }
             for key in ["fps", "enableHDRVideo", "loadFromMemory", "language"] {
                 if let value = existing[key] { object[key] = value }
             }
@@ -461,7 +479,11 @@ final class ScreenSaverManager {
             ? dynamicLockScreenConfigurationURL
             : configurationURL
         try fm.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if (try? Data(contentsOf: targetURL)) == data { return }
         try data.write(to: targetURL, options: .atomic)
+        DistributedNotificationCenter.default().postNotificationName(
+            Notification.Name("cn.laobamac.Mirage.screensaver.configurationChanged"),
+            object: forDynamicLockScreen ? "lock" : "saver", userInfo: nil, deliverImmediately: true)
     }
 
     func updateLoadFromMemory(_ enabled: Bool, forDynamicLockScreen: Bool = false) {
@@ -490,7 +512,8 @@ final class ScreenSaverManager {
                   let updated = try? JSONSerialization.data(
                     withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
             else { return }
-            try? updated.write(to: targetURL, options: .atomic)
+            do { try commitConfiguration(updated, forDynamicLockScreen: forDynamicLockScreen) }
+            catch { NSLog("[Mirage] Screen saver configuration update failed: %@", error.localizedDescription) }
         }
     }
 

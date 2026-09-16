@@ -41,6 +41,26 @@ class WallpaperViewModel: PlaylistPlayback {
     let renderer = RendererController()
     let propertyModel = WallpaperPropertyModel()
     let controlState = WallpaperControlState()
+    private var externalLockPreparation: UUID?
+    private var resetStorageAssignments: [DisplayKey: UUID] = [:]
+    private var scriptStorageSnapshots: [DisplayKey: (wallpaperID: String, values: [String: String])] = [:]
+
+    func renderSnapshots(for wallpaperID: String) -> [String: WallpaperRenderSnapshot] {
+        Dictionary(uniqueKeysWithValues: displayStates.compactMap { key, state in
+            let wallpaper = state.wallpaper
+            guard wallpaper.id == wallpaperID else { return nil }
+            let storage = scriptStorageSnapshots[key].flatMap {
+                $0.wallpaperID == wallpaper.id ? $0.values : nil
+            }
+            return (key.rawValue, WallpaperRenderSnapshot(runtime: state.runtime,
+                properties: effectiveProperties(for: wallpaper, runtime: state.runtime), scriptStorage: storage))
+        })
+    }
+
+    @MainActor
+    func refreshScriptStorage(for wallpaper: WEWallpaper? = nil) async {
+        await renderer.refreshScriptStorage(wallpaperID: wallpaper?.id)
+    }
 
     private struct PreviewSelection {
         let id: UUID
@@ -194,6 +214,18 @@ class WallpaperViewModel: PlaylistPlayback {
         displayStatesChanges.send(loaded)
         committedAssignmentIDs = Dictionary(uniqueKeysWithValues: loaded.keys.map { ($0, UUID()) })
 
+        renderer.onScriptStorageChanged = { [weak self] displayID, wallpaperID, assignmentID, values in
+            guard let self, self.persistsChanges,
+                  let key = DisplayRegistry.shared.info(forDisplay: displayID)?.key,
+                  let state = self.displayStates[key], state.wallpaper.id == wallpaperID,
+                  assignmentID == self.committedAssignmentIDs[key],
+                  assignmentID != self.resetStorageAssignments[key] else { return }
+            self.resetStorageAssignments[key] = nil
+            if let previous = self.scriptStorageSnapshots[key],
+               previous.wallpaperID == wallpaperID, previous.values == values { return }
+            self.scriptStorageSnapshots[key] = (wallpaperID, values)
+            self.scheduleRuntimeSave(for: key)
+        }
         renderer.isWallpaperTrusted = { WallpaperViewModel.isWallpaperTrusted($0) }
         renderer.onPositionAvailabilityChanged = { [weak self] displayID in
             guard let self, self.selectedDisplay?.displayID == displayID else { return }
@@ -1164,7 +1196,7 @@ class WallpaperViewModel: PlaylistPlayback {
         let properties = Self.propertyValues(for: wallpaper, runtime: normalized)
         let context = ScreenSaverManager.ConfigurationContext(
             wallpaperID: wallpaper.id, runtime: normalized,
-            fps: Int(AppDelegate.shared.globalSettingsViewModel.settings.fps))
+            fps: Int(AppDelegate.shared.globalSettingsViewModel.settings.fps), sourceDisplay: key)
         persistenceQueue.submit(key: "runtime:" + wallpaper.id) {
             guard let data = try? JSONEncoder().encode(shared) else { return }
             UserDefaults.standard.set(data, forKey: Self.runtimeKey(for: wallpaper))
@@ -1173,9 +1205,10 @@ class WallpaperViewModel: PlaylistPlayback {
         }
         if let displayID = DisplayRegistry.shared.displayID(for: key) {
             MainActor.assumeIsolated {
-                DynamicLockScreenManager.shared.updatePosition(
-                    normalized.position, fillMode: normalized.fillMode,
-                    wallpaperID: wallpaper.id, displayID: displayID)
+                if let snapshot = context.runtimeByDisplay[key.rawValue] {
+                    DynamicLockScreenManager.shared.updateRuntime(snapshot, wallpaper: wallpaper,
+                        displayKey: key.rawValue, displayID: displayID)
+                }
             }
         }
     }
@@ -1517,6 +1550,8 @@ class WallpaperViewModel: PlaylistPlayback {
         let key = selectedDisplayKey
         guard var state = displayStates[key] else { return }
         state.runtime = WallpaperRuntimeState()
+        scriptStorageSnapshots[key] = (state.wallpaper.id, [:])
+        resetStorageAssignments[key] = committedAssignmentIDs[key]
         displayStates[key] = state
         lastAppliedPlayback[key] = nil
         persistStates()
@@ -1612,6 +1647,22 @@ class WallpaperViewModel: PlaylistPlayback {
             force: true)
     }
 
+    @MainActor
+    func prepareForExternalLockScreen() async -> Bool {
+        guard !externalLockScreenSuspended else { return false }
+        let request = UUID()
+        externalLockPreparation = request
+        await refreshScriptStorage()
+        guard externalLockPreparation == request else { return false }
+        externalLockPreparation = nil
+        saveRuntime()
+        flushPendingSaves()
+        ScreenSaverManager.shared.flushConfigurationUpdates()
+        DynamicLockScreenManager.shared.flushConfigurationUpdates()
+        suspendForExternalLockScreen()
+        return true
+    }
+
     func suspendForExternalLockScreen() {
         guard !externalLockScreenSuspended else { return }
         externalLockScreenSuspended = true
@@ -1631,6 +1682,7 @@ class WallpaperViewModel: PlaylistPlayback {
     }
 
     func resumeAfterExternalLockScreen() {
+        externalLockPreparation = nil
         guard externalLockScreenSuspended, renderer.resumeAfterSuspension() else { return }
         externalLockScreenSuspended = false
         UserDefaults.standard.set(false, forKey: "Mirage.DynamicLockScreen.Locked")
