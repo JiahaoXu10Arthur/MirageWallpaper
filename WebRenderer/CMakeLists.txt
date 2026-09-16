@@ -63,3 +63,8 @@ endif()
 if(WEBRENDERER_BUILD_WALLPAPER)
     add_subdirectory(Tools/WebWallpaper)
 endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_subdirectory(Tests)
+endif()
