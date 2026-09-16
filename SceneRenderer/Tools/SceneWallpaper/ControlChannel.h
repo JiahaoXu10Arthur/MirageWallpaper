@@ -56,12 +56,14 @@ public:
                         std::function<void()> on_activate = {},
                         std::function<void()> on_deactivate = {},
                         std::function<void(const std::string&, const std::string&)>
-                            on_snapshot = {})
+                            on_snapshot = {},
+                        std::function<void(const std::string&)> on_storage = {})
         : m_wallpaper(wallpaper),
           m_on_quit(std::move(on_quit)),
           m_on_activate(std::move(on_activate)),
           m_on_deactivate(std::move(on_deactivate)),
-          m_on_snapshot(std::move(on_snapshot)) {}
+          m_on_snapshot(std::move(on_snapshot)),
+          m_on_storage(std::move(on_storage)) {}
 
     ~SceneControlChannel() { stop(); }
 
@@ -92,6 +94,7 @@ private:
     std::function<void()> m_on_activate;
     std::function<void()> m_on_deactivate;
     std::function<void(const std::string&, const std::string&)> m_on_snapshot;
+    std::function<void(const std::string&)> m_on_storage;
     std::atomic<bool>     m_running { false };
     std::thread           m_thread;
 };

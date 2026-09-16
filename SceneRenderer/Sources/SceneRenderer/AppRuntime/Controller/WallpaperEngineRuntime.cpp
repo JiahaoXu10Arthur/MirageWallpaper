@@ -72,6 +72,9 @@ struct RenderRequestPreparedPassDiagnostics {
     RenderPassDiagnosticCallback cb;
 };
 struct RenderResetScriptStorage {};
+struct RenderExportScriptStorage {
+    std::function<void(std::string)> callback;
+};
 
 // Wrapped in a non-std struct so the rstd channel's internal `addressof`
 // calls don't fall into ADL ambiguity with std::addressof when the element
@@ -80,7 +83,7 @@ struct RenderMsg {
     std::variant<RenderInit, RenderSetScene, RenderSetFillMode, RenderSetPosition, RenderSetSpeed,
                  RenderSetUserProperty, RenderSetMediaStatus, RenderStop, RenderDraw,
                  RenderSwapchainReady, RenderRequestPreparedPassDiagnostics,
-                 RenderResetScriptStorage>
+                 RenderResetScriptStorage, RenderExportScriptStorage>
         v;
 };
 
@@ -1124,6 +1127,7 @@ public:
     void on(RenderSwapchainReady&&);
     void on(RenderRequestPreparedPassDiagnostics&&);
     void on(RenderResetScriptStorage&&);
+    void on(RenderExportScriptStorage&&);
 
     ExSwapchain* exSwapchain() const { return m_render->exSwapchain(); }
     vulkan::VulkanRender* render() const { return m_render.get(); }
@@ -1685,6 +1689,10 @@ void SceneRenderController::on(RenderRequestPreparedPassDiagnostics&& m) {
     } });
 }
 
+void SceneRenderController::on(RenderExportScriptStorage&& message) {
+    if (message.callback) message.callback(m_scene ? sr::script::SceneStorageSnapshot(*m_scene) : "{}");
+}
+
 void SceneRenderController::on(RenderResetScriptStorage&&) {
     if (! m_scene) return;
     sr::script::ResetSceneLocalStorage(*m_scene);
@@ -1899,6 +1907,8 @@ void SceneRuntimeController::loadScene() {
     std::string scene_id = pkgPath_fs.parent_path().filename().native();
     MergeProjectUserProperties(pkgPath_fs.parent_path(), m_user_properties);
 
+    m_scene_parser.SetScriptStorageSnapshot(m_config.script_storage_snapshot);
+    if (!m_config.script_storage_snapshot) {
     std::filesystem::path script_storage_dir;
     if (! m_config.script_storage_dir.empty()) {
         script_storage_dir = m_config.script_storage_dir;
@@ -1926,6 +1936,9 @@ void SceneRuntimeController::loadScene() {
                                     storage_ec);
     }
     m_scene_parser.SetScriptPersistencePath(script_storage_file.native());
+    } else {
+        m_scene_parser.SetScriptPersistencePath({});
+    }
 
     // load pkgfile. Read pkg version stamp before move-mounting so we can
     // pass it to the scene parser; on fallback (loose dir) we have no
@@ -1967,6 +1980,7 @@ void SceneRuntimeController::loadScene() {
         m_scene_parser.SetUserProperties(rstd::Some(
             rstd::ref<rstd::json::Map>::from_raw_parts(rstd::addressof(m_user_properties))));
         scene = m_scene_parser.Parse(scene_id, *scene_doc, vfs, *m_sound_manager);
+        if (scene) sr::script::SetSceneStorageCallback(*scene, m_config.script_storage_callback);
         m_scene_parser.SetUserProperties(rstd::None());
 
         // Start (or resume) the output device now that this scene's sound
@@ -2209,6 +2223,10 @@ void SceneWallpaper::setOnUserPropertyDiagnostics(UserPropertyDiagnosticCallback
 void SceneWallpaper::requestPreparedPassDiagnostics(RenderPassDiagnosticCallback cb) {
     (void)m_runtime->renderSender().send(
         RenderMsg { RenderRequestPreparedPassDiagnostics { std::move(cb) } });
+}
+
+void SceneWallpaper::exportScriptStorage(std::function<void(std::string)> callback) {
+    (void)m_runtime->renderSender().send(RenderMsg { RenderExportScriptStorage { std::move(callback) } });
 }
 
 void SceneWallpaper::resetScriptStorage() {

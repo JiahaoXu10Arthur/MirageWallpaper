@@ -547,7 +547,9 @@ std::vector<sr::SceneNode*> SpawnLayerClones(ParseContext& context, SceneNode* t
 script::ScriptScene& EnsureScriptScene(ParseContext& context) {
     if (! context.script_scene) {
         context.script_scene = std::make_unique<script::ScriptScene>();
-        if (! context.script_persistence_path.empty())
+        if (context.script_storage_snapshot)
+            context.script_scene->runtime().SetStorageSnapshot(*context.script_storage_snapshot);
+        else if (! context.script_persistence_path.empty())
             context.script_scene->runtime().SetPersistence(context.script_persistence_path);
         context.script_scene->runtime().SetCanvasSize(static_cast<float>(context.ortho_w),
                                                       static_cast<float>(context.ortho_h));
@@ -6227,13 +6229,15 @@ std::array<i32, 2> ResolveOrthoProjectionExtent(const wpscene::SceneMetadata&   
 ParseContext BuildContext(fs::VFS& vfs, std::string_view scene_id, const wpscene::SceneMetadata& sc,
                           std::array<i32, 2>                       ortho_extent,
                           rstd::Option<rstd::ref<rstd::json::Map>> user_properties,
-                          std::string script_persistence_path) {
+                          std::string script_persistence_path,
+                          std::optional<std::string> script_storage_snapshot) {
     ParseContext context;
     InitContext(context, vfs, sc, ortho_extent);
     ParseCamera(context, sc);
     context.user_properties = user_properties;
     context.pkg_version     = sc.pkg_version;
     context.script_persistence_path = std::move(script_persistence_path);
+    context.script_storage_snapshot = std::move(script_storage_snapshot);
 
     context.scene->renderTargets[SpecTex_Default.data()] = {
         .width             = context.ortho_w,
@@ -7135,7 +7139,8 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view              scene_
                                             sc,
                                             ortho_extent,
                                             m_user_properties,
-                                            m_script_persistence_path);
+                                            m_script_persistence_path,
+                                            m_script_storage_snapshot);
     context.scene_has_scripts       = SceneHasScripts(json, scene_objs);
     context.scene_accesses_effects  = SceneAccessesEffects(json, scene_objs);
     context.scene_layer_text_writes = SceneWritesLayerText(json, scene_objs);

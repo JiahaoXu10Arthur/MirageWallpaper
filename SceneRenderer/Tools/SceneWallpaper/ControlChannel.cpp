@@ -230,6 +230,10 @@ void SceneControlChannel::dispatchLine(const char* line) {
         m_wallpaper.setMuted(true);
         m_wallpaper.pause();
         if (m_on_deactivate) m_on_deactivate();
+    } else if (cmd == "exportScriptStorage") {
+        auto token = msg.get("token");
+        if (m_on_storage && token.is_some() && (*token)->is_string())
+            m_on_storage(rstd::cppstd::to_string(*(*token)->as_str()));
     } else if (cmd == "resetScriptStorage") {
         m_wallpaper.resetScriptStorage();
     } else if (cmd == "quit") {

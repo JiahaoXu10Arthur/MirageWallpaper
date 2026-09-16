@@ -136,6 +136,7 @@ struct Options {
     std::string               scene_pkg;
     std::string               cache_dir;
     std::string               user_properties;
+    std::string               runtime_settings;
     std::optional<Resolution> resolution;
     std::optional<std::array<double, 2>> mouse_position;
     std::uint32_t             fps { 30 };
@@ -392,6 +393,10 @@ bool ParseArgs(int argc, char** argv, Options& out) {
             const char* value = require_value(i, arg);
             if (value == nullptr) return false;
             out.user_properties = value;
+        } else if (arg == "--runtime") {
+            const char* value = require_value(i, arg);
+            if (value == nullptr) return false;
+            out.runtime_settings = value;
         } else if (arg == "--mouse-position") {
             const char* value = require_value(i, arg);
             if (value == nullptr) return false;
@@ -577,10 +582,39 @@ int main(int argc, char** argv) {
     config.spectrum_enabled = options.spectrum_enabled;
     config.external_spectrum = options.external_spectrum;
     config.load_from_memory = options.load_from_memory;
+    config.script_storage_callback = [](std::string snapshot) {
+        std::lock_guard lock(LifecycleOutputMutex());
+        std::cout << "{\"event\":\"script-storage\",\"values\":" << snapshot << "}\n" << std::flush;
+    };
     if (options.cache_dir.empty())
         config.cache_dir = sr::platform::GetCachePath("SceneRenderer");
     else
         config.cache_dir = options.cache_dir;
+
+    if (!options.runtime_settings.empty()) {
+        std::ifstream file(options.runtime_settings);
+        std::string source(std::istreambuf_iterator<char>(file), {});
+        auto parsed = sr::ParseJson(source, { .allow_comments = false });
+        if (!file || parsed.is_err()) {
+            wallpaper.reset();
+            state.wallpaper = nullptr;
+            SceneRendererMacDesktopDestroy(state.desktop);
+            return 1;
+        }
+        auto runtime = parsed.unwrap();
+        if (!runtime.is_object()) {
+            wallpaper.reset();
+            state.wallpaper = nullptr;
+            SceneRendererMacDesktopDestroy(state.desktop);
+            return 1;
+        }
+        if (auto speed = runtime.get("speed"); speed.is_some())
+            config.speed = static_cast<float>((*speed)->as_f64().unwrap_or(1.0));
+        config.script_storage_snapshot = "{}";
+        config.script_storage_callback = {};
+        if (auto storage = runtime.get("scriptStorage"); storage.is_some() && (*storage)->is_object())
+            config.script_storage_snapshot = sr::Dump(**storage);
+    }
 
     if (! LoadUserProperties(options.user_properties, config)) {
         wallpaper.reset();
@@ -703,6 +737,13 @@ int main(int argc, char** argv) {
             [](const std::string& path, const std::string& token) {
                 const bool ok = ! path.empty() && mirage::WriteSceneSnapshot(path);
                 EmitSnapshotDone(token, ok);
+            },
+            [renderer = wallpaper.get()](const std::string& token) {
+                renderer->exportScriptStorage([token](std::string snapshot) {
+                    std::lock_guard lock(LifecycleOutputMutex());
+                    std::cout << "{\"event\":\"script-storage\",\"token\":\"" << JsonEscaped(token)
+                              << "\",\"values\":" << snapshot << "}\n" << std::flush;
+                });
             });
         control->start();
     }
