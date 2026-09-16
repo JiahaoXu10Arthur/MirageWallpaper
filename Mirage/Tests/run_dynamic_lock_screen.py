@@ -5,6 +5,7 @@
 #
 
 from pathlib import Path
+import argparse
 import platform
 import plistlib
 import shutil
@@ -14,6 +15,9 @@ import uuid
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--native-runtime", action="store_true")
+    args = parser.parse_args()
     project = Path(__file__).resolve().parents[1]
     artifacts = Path(tempfile.mkdtemp(prefix="mirage-lock-regression-"))
     app = artifacts / "LockRegression.app"
@@ -52,7 +56,12 @@ def main():
     shutil.copy2(executable, service / "Contents/MacOS/LockRegressionService")
     for bundle in [service, app]:
         subprocess.run(["codesign", "--force", "--sign", "-", str(bundle)], check=True)
-    subprocess.run([str(executable)], check=True, timeout=30)
+    command = [str(executable)]
+    if args.native_runtime:
+        root = project.parent
+        command += ["--native-runtime", str(root / "SceneRenderer/build/macos-clang-release/Tools/SceneScreenSaver/libMirageSceneSaver.dylib"),
+                    str(root / "assets")]
+    subprocess.run(command, check=True, timeout=90 if args.native_runtime else 30)
 
 
 if __name__ == "__main__":
