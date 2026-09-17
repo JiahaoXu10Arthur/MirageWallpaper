@@ -4,6 +4,12 @@ module;
 #include "vvk/macros.hpp"
 
 #include <atomic>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <filesystem>
+#include <iomanip>
+#include "vk_mem_alloc.h"
 #include <unistd.h>
 #include <vulkan/vulkan.h>
 
@@ -549,12 +555,160 @@ struct RenderProgram {
         flushScopePasses();
     }
 
+    struct DiagnosticReadback {
+        vvk::VmaBuffer buffer;
+        std::string name;
+        uint32_t width;
+        uint32_t height;
+        bool half;
+        std::size_t size;
+    };
+    std::vector<DiagnosticReadback> diagnostic_readbacks;
+    std::size_t diagnostic_bytes { 0 };
+    uint64_t diagnostic_frame { 0 };
+    uint64_t diagnostic_capture_frame { 0 };
+    bool diagnostic_ready { false };
+    bool diagnostic_finished { false };
+
+    void captureDiagnostic(const Device& device, RenderingResources& rr, VulkanPass* pass, bool input) {
+        const char* directory = std::getenv("SCENERENDERER_DIAGNOSTICS_DIR");
+        if (directory == nullptr || diagnostic_capture_frame == 0 || diagnostic_frame != diagnostic_capture_frame || diagnostic_readbacks.size() >= 8) return;
+        auto* material_pass = dynamic_cast<CustomShaderPass*>(pass);
+        if (material_pass == nullptr) return;
+        const auto& desc = material_pass->desc();
+        if (desc.node == nullptr || desc.node->Mesh() == nullptr) return;
+        const auto& mesh = *desc.node->Mesh();
+        if (desc.submesh_index >= mesh.Submeshes().size()) return;
+        const auto slot = mesh.Submeshes()[desc.submesh_index].material_slot;
+        if (slot >= mesh.MaterialSlots().size() || !mesh.MaterialSlots()[slot]) return;
+        const auto& shader = mesh.MaterialSlots()[slot]->customShader.shader;
+        if (!shader) return;
+        const std::string& name = shader->name;
+        const bool selected = input ? name.find("godrays_downsample") != std::string::npos
+                                    : name.find("color_grading") != std::string::npos ||
+                                      name.find("godrays_combine") != std::string::npos ||
+                                      name.find("combine_hdr") != std::string::npos;
+        if (!selected) return;
+        ImageParameters image = desc.vk_output;
+        auto request = desc.output_request;
+        if (input) {
+            if (desc.vk_textures.empty() || desc.vk_textures[0].slots.empty() || desc.texture_bindings.empty()) return;
+            image = desc.vk_textures[0].getActive();
+            request = desc.texture_bindings[0].request;
+        }
+        if (!request || !request->cache_key || image.handle == VK_NULL_HANDLE) return;
+        const auto format = request->cache_key->format;
+        if (format != sr::TextureFormat::RGBA8 && format != sr::TextureFormat::RGBA16F) return;
+        const bool half = format == sr::TextureFormat::RGBA16F;
+        const std::size_t size = std::size_t(image.extent.width) * image.extent.height * (half ? 8u : 4u);
+        if (size == 0 || size > 256u * 1024u * 1024u - diagnostic_bytes) return;
+        VkBufferCreateInfo info { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+                                  .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT };
+        VmaAllocationCreateInfo allocation {};
+        allocation.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+        DiagnosticReadback dump { .name = (input ? "input/" : "output/") + name,
+                                  .width = image.extent.width, .height = image.extent.height,
+                                  .half = half, .size = size };
+        if (vvk::CreateBuffer(device.vma_allocator(), info, allocation, dump.buffer) != VK_SUCCESS) return;
+        VkImageMemoryBarrier barrier {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image.handle,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        rr.command.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, barrier);
+        VkBufferImageCopy copy { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = image.extent };
+        rr.command.CopyImageToBuffer(image.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, *dump.buffer, copy);
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        rr.command.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, barrier);
+        diagnostic_bytes += size;
+        diagnostic_readbacks.push_back(std::move(dump));
+    }
+
+    void finishDiagnostics(const Device& device) {
+        const char* directory = std::getenv("SCENERENDERER_DIAGNOSTICS_DIR");
+        if (directory == nullptr) return;
+        if (diagnostic_frame >= 606 && !diagnostic_ready) {
+            std::ofstream ready(std::string(directory) + "/ready");
+            ready << "live-frame-ready";
+            diagnostic_ready = true;
+        }
+        if (diagnostic_capture_frame == 0 || diagnostic_finished) return;
+        for (std::size_t index = 0; index < diagnostic_readbacks.size(); ++index) {
+            auto& dump = diagnostic_readbacks[index];
+            void* mapped = nullptr;
+            if (dump.buffer.MapMemory(&mapped) != VK_SUCCESS || mapped == nullptr) continue;
+            vmaInvalidateAllocation(device.vma_allocator(), dump.buffer.Allocation(), 0, dump.size);
+            const auto* data = static_cast<const uint8_t*>(mapped);
+            const std::string base = std::string(directory) + "/stage-" + std::to_string(index);
+            std::ofstream image(base + ".ppm", std::ios::binary);
+            image << "P6\n" << dump.width << " " << dump.height << "\n255\n";
+            std::array<uint64_t, 4> nonfinite {}, negative {}, above_one {};
+            std::array<double, 4> sums {};
+            for (std::size_t pixel = 0; pixel < std::size_t(dump.width) * dump.height; ++pixel) {
+                char rgb[3] {};
+                for (unsigned channel = 0; channel < 4; ++channel) {
+                    double value;
+                    if (dump.half) {
+                        uint16_t bits;
+                        std::memcpy(&bits, data + (pixel * 4 + channel) * 2, 2);
+                        const unsigned exp = (bits >> 10) & 31u;
+                        const unsigned mantissa = bits & 1023u;
+                        value = exp == 31 ? std::numeric_limits<double>::quiet_NaN()
+                                : exp == 0 ? std::ldexp(double(mantissa), -24)
+                                           : std::ldexp(double(mantissa + 1024), int(exp) - 25);
+                        if (bits & 0x8000) value = -value;
+                    } else value = double(data[pixel * 4 + channel]) / 255.0;
+                    if (!std::isfinite(value)) { ++nonfinite[channel]; value = 0; }
+                    else { sums[channel] += value; negative[channel] += value < 0; above_one[channel] += value > 1; }
+                    if (channel < 3) rgb[channel] = static_cast<char>(std::clamp(value, 0.0, 1.0) * 255.0 + 0.5);
+                }
+                image.write(rgb, 3);
+            }
+            dump.buffer.UnMapMemory();
+            std::ofstream metadata(base + ".json");
+            metadata << "{\"shader\":" << std::quoted(dump.name) << ",\"width\":" << dump.width
+                     << ",\"height\":" << dump.height << ",\"format\":\"" << (dump.half ? "RGBA16F" : "RGBA8")
+                     << "\",\"frame\":" << diagnostic_capture_frame << ",\"readback_may_be_corrupted\":true,\"channels\":[";
+            for (unsigned c = 0; c < 4; ++c) {
+                if (c) metadata << ",";
+                metadata << "{\"nonfinite\":" << nonfinite[c] << ",\"negative\":" << negative[c]
+                         << ",\"above_one\":" << above_one[c] << ",\"sum\":" << sums[c] << "}";
+            }
+            metadata << "]}\n";
+        }
+        diagnostic_readbacks.clear();
+        std::error_code error;
+        if (std::filesystem::exists(std::string(directory) + "/frame.ppm", error)) {
+            std::ofstream completed(std::string(directory) + "/captured");
+            completed << "capture-complete";
+            diagnostic_finished = true;
+        }
+    }
+
     void execute(const Device& device, RenderingResources& rr) {
+        if (const char* directory = std::getenv("SCENERENDERER_DIAGNOSTICS_DIR")) {
+            ++diagnostic_frame;
+            std::error_code error;
+            if (diagnostic_capture_frame == 0 && std::filesystem::exists(std::string(directory) + "/capture", error))
+                diagnostic_capture_frame = diagnostic_frame;
+        }
         for (auto& scope : scopes) {
             if (scope.single != nullptr) {
                 auto* pass = scope.single->pass;
                 if (pass->prepared()) {
+                    captureDiagnostic(device, rr, pass, true);
                     pass->execute(device, rr);
+                    captureDiagnostic(device, rr, pass, false);
                 }
                 continue;
             }
@@ -564,7 +718,9 @@ struct RenderProgram {
             if (scoped_passes.size() == 1) {
                 auto* pass = scoped_passes.front()->pass;
                 if (pass->prepared()) {
+                    captureDiagnostic(device, rr, pass, true);
                     pass->execute(device, rr);
+                    captureDiagnostic(device, rr, pass, false);
                 }
                 continue;
             }
@@ -578,11 +734,13 @@ struct RenderProgram {
             for (auto* record : scoped_passes) {
                 record->pass->prepareRenderScopeDraw(rr);
             }
+            captureDiagnostic(device, rr, scoped_passes.front()->pass, true);
             scoped_passes.front()->pass->beginRenderScope(rr);
             for (auto* record : scoped_passes) {
                 record->pass->recordRenderScopeDraw(rr);
             }
             scoped_passes.front()->pass->endRenderScope(rr);
+            captureDiagnostic(device, rr, scoped_passes.back()->pass, false);
         }
     }
 };
@@ -1331,6 +1489,7 @@ bool VulkanRender::Impl::retireInFlightFrame() {
     m_frame_in_flight = false;
     ReleaseCompletedRetiredResources(rr);
     m_finpass->finishFrameDump(*m_device);
+    m_program.finishDiagnostics(*m_device);
     m_device->tex_cache().ReleaseRecordedUploads();
     finishMeshUpload();
     rr.pending_upload_value = 0;
@@ -1583,6 +1742,7 @@ bool VulkanRender::Impl::drawFrameOffscreen() {
     }
     ReleaseCompletedRetiredResources(rr);
     m_finpass->finishFrameDump(*m_device);
+    m_program.finishDiagnostics(*m_device);
     m_device->tex_cache().ReleaseRecordedUploads();
     finishMeshUpload();
     rr.pending_upload_value = 0;

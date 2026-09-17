@@ -303,6 +303,45 @@ void EncodeTexture(MacDesktopHost* host, id<MTLCommandBuffer> command_buffer,
     [encoder endEncoding];
 }
 
+void CaptureDiagnosticPresentation(id<MTLCommandBuffer> command_buffer, id<MTLTexture> texture) {
+    static bool recorded = false;
+    const char* directory = std::getenv("SCENERENDERER_DIAGNOSTICS_DIR");
+    if (directory == nullptr || recorded || texture.pixelFormat != MTLPixelFormatBGRA8Unorm) return;
+    NSString* root = [NSString stringWithUTF8String:directory];
+    if (![NSFileManager.defaultManager fileExistsAtPath:[root stringByAppendingPathComponent:@"capture"]]) return;
+    const NSUInteger width = texture.width;
+    const NSUInteger height = texture.height;
+    const NSUInteger row_bytes = (width * 4 + 255) & ~NSUInteger(255);
+    if (height == 0 || row_bytes > 256 * 1024 * 1024 / height) return;
+    id<MTLBuffer> buffer = [texture.device newBufferWithLength:row_bytes * height options:MTLResourceStorageModeShared];
+    if (buffer == nil) return;
+    id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+    if (blit == nil) { [buffer release]; return; }
+    [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+              sourceSize:MTLSizeMake(width, height, 1) toBuffer:buffer destinationOffset:0
+              destinationBytesPerRow:row_bytes destinationBytesPerImage:row_bytes * height];
+    [blit endEncoding];
+    recorded = true;
+    NSString* destination = [root stringByAppendingPathComponent:@"metalfx-present.ppm"];
+    [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        if (completed.status == MTLCommandBufferStatusCompleted) {
+            NSMutableData* data = [NSMutableData data];
+            NSString* header = [NSString stringWithFormat:@"P6\n%lu %lu\n255\n", width, height];
+            [data appendData:[header dataUsingEncoding:NSASCIIStringEncoding]];
+            const auto* bytes = static_cast<const uint8_t*>(buffer.contents);
+            for (NSUInteger y = 0; y < height; ++y) {
+                for (NSUInteger x = 0; x < width; ++x) {
+                    const auto* pixel = bytes + y * row_bytes + x * 4;
+                    const uint8_t rgb[] = { pixel[2], pixel[1], pixel[0] };
+                    [data appendBytes:rgb length:3];
+                }
+            }
+            [data writeToFile:destination atomically:YES];
+        }
+    }];
+    [buffer release];
+}
+
 void CopyTexture(id<MTLCommandBuffer> command_buffer, id<MTLTexture> source,
                  id<MTLTexture> destination) {
     id<MTLBlitCommandEncoder> encoder = [command_buffer blitCommandEncoder];
@@ -665,6 +704,8 @@ extern "C" void* SceneRendererMacDesktopCreate(const SceneRendererMacDesktopConf
         window.collectionBehavior    = NSWindowCollectionBehaviorCanJoinAllSpaces |
                                     NSWindowCollectionBehaviorStationary |
                                     NSWindowCollectionBehaviorIgnoresCycle;
+        const bool diagnostic = std::getenv("SCENERENDERER_DIAGNOSTICS_DIR") != nullptr;
+        if (diagnostic) window.level = NSNormalWindowLevel + 1;
         const bool deferred_show     = config != nullptr && config->deferred_show;
         host->activation_confirmed.store(! deferred_show);
         window.opaque                = deferred_show ? NO : YES;
@@ -938,6 +979,7 @@ extern "C" void SceneRendererMacDesktopPresentMetalFrame(
             NSLog(@"SceneRenderer MetalFX Spatial unavailable for this frame; using linear fallback");
         }
 
+        CaptureDiagnosticPresentation(command_buffer, drawable.texture);
         SRHostRef* ref = host->hostRef;
         [drawable addPresentedHandler:^(id<MTLDrawable>) {
           ScheduleFramePresented(ref);

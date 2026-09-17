@@ -42,6 +42,8 @@ bool Device::initPipelineCache() {
     auto cache_dir = home != nullptr && home[0] != '\0'
                          ? std::filesystem::path(home) / "Library/Caches/SceneRenderer/vulkan"
                          : std::filesystem::temp_directory_path() / "SceneRenderer/vulkan";
+    const char* diagnostic_cache = std::getenv("SCENERENDERER_DIAGNOSTIC_CACHE");
+    if (diagnostic_cache != nullptr && diagnostic_cache[0] != '\0') cache_dir = diagnostic_cache;
     std::filesystem::create_directories(cache_dir, ec);
     if (ec) {
         rstd_warn("pipeline cache directory unavailable: {}", ec.message());

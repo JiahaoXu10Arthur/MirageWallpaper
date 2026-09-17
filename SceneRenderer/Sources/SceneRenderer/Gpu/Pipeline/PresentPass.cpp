@@ -4,6 +4,7 @@ module;
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
 #include <mutex>
 #define VK_USE_PLATFORM_METAL_EXT
 #include <vulkan/vulkan.h>
@@ -229,6 +230,10 @@ std::vector<PassTextureRequestDiagnostic> FinPass::textureRequestDiagnostics() c
 }
 
 void FinPass::recordFrameDump(const Device& device, RenderingResources& rr) {
+    if (const char* directory = std::getenv("SCENERENDERER_DIAGNOSTICS_DIR")) {
+        std::error_code error;
+        if (!std::filesystem::exists(std::string(directory) + "/capture", error)) return;
+    }
     const bool live_frame = LiveFrameRequested();
     if ((m_dump_done && ! live_frame) || m_dump_pending) return;
     const char* dump_path = FrameDumpPath();
@@ -287,6 +292,7 @@ void FinPass::recordFrameDump(const Device& device, RenderingResources& rr) {
 
 void FinPass::recordPresentDump(const Device& device, RenderingResources& rr) {
     if (m_present_dump_done || m_present_dump_pending) return;
+    if (std::getenv("SCENERENDERER_DIAGNOSTICS_DIR") != nullptr && !m_dump_pending && !m_dump_done) return;
     const char* dump_path = PresentDumpPath();
     if (dump_path == nullptr) return;
     if (! m_desc.present_can_transfer_src) {
@@ -387,6 +393,7 @@ void FinPass::finishFrameDump(const Device& device) {
                     rstd_warn("SCENERENDERER_DUMP_FRAME: open output failed: {}", m_dump_path);
                 } else {
                     WritePpm(out, rgba, m_dump_width, m_dump_height, VK_FORMAT_R8G8B8A8_UNORM);
+                    out.close();
                     rstd_info("SCENERENDERER_DUMP_FRAME: wrote {} ({}x{})",
                               m_dump_path,
                               m_dump_width,

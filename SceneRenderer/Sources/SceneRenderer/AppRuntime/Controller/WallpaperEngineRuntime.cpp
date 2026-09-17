@@ -1274,8 +1274,11 @@ void SceneRenderController::on(RenderDraw&&) {
     }
     frame_timer.FrameBegin();
     if (m_rg) {
+        const bool diagnostic = std::getenv("SCENERENDERER_DIAGNOSTICS_DIR") != nullptr;
+        const double diagnostic_step = diagnostic && m_scene->elapsingTime < 20.0 ? 1.0 / 30.0 : 0.0;
+        if (diagnostic) m_scene->frameTime = diagnostic_step;
         {
-            auto pos                 = m_mouse_pos.load();
+            auto pos                 = diagnostic ? std::array<float, 2> { 0.5f, 0.5f } : m_mouse_pos.load();
             m_scene->pointerPosition = pos;
             m_scene->shaderValueUpdater->MouseInput(pos[0], pos[1]);
         }
@@ -1337,6 +1340,17 @@ void SceneRenderController::on(RenderDraw&&) {
             const bool             stale =
                 ! primed || spec.publish_ms == 0 || (now_ms - spec.publish_ms) > kStaleMs;
             if (stale) spec.clear();
+            if (diagnostic) {
+                fi.frametime = static_cast<float>(diagnostic_step);
+                fi.time_of_day = 0.5f;
+                fi.cursor_x = 0.5f;
+                fi.cursor_y = 0.5f;
+                fi.cursor_world = m_scene->CursorPositionOnCanvas(0.5, 0.5);
+                fi.mouse_buttons_down = 0;
+                fi.mouse_buttons_pressed = 0;
+                fi.mouse_buttons_released = 0;
+                spec.clear();
+            }
             fi.audio_left    = spec.left;
             fi.audio_right   = spec.right;
             fi.audio_average = spec.average;
@@ -1354,7 +1368,7 @@ void SceneRenderController::on(RenderDraw&&) {
                 for (std::size_t i = begin; i < end; ++i) sum += fi.audio_average[i];
                 const float level = end > begin ? sum / static_cast<float>(end - begin) : 0.0f;
                 auto&       slot  = m_scene->audioAverage[bin];
-                const float old   = slot.load(std::memory_order_relaxed);
+                const float old   = diagnostic ? 0.0f : slot.load(std::memory_order_relaxed);
                 slot.store(std::max(old * 0.75f, level), std::memory_order_relaxed);
             }
             if (m_scene->uses_audio_spectrum) {
@@ -1395,7 +1409,7 @@ void SceneRenderController::on(RenderDraw&&) {
             return;
         }
 
-        m_scene->PassFrameTime(frame_timer.IdeaTime() * m_speed);
+        m_scene->PassFrameTime(diagnostic ? diagnostic_step : frame_timer.IdeaTime() * m_speed);
 
         m_scene->shaderValueUpdater->FrameEnd();
 

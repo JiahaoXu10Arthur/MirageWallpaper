@@ -628,6 +628,11 @@ int main(int argc, char** argv) {
     const bool use_metalfx = options.metalfx &&
                              SceneRendererMacDesktopPrepareMetalFX(state.desktop);
     info.offscreen          = use_metalfx;
+    if (const char* directory = std::getenv("SCENERENDERER_DIAGNOSTICS_DIR")) {
+        std::ofstream mode(std::string(directory) + "/presentation.json");
+        mode << "{\"metalfx_requested\":" << (options.metalfx ? "true" : "false")
+             << ",\"metalfx_presenter\":" << (use_metalfx ? "true" : "false") << "}\n";
+    }
     info.width              = ClampRenderExtent(render_width, 1920);
     info.height             = ClampRenderExtent(render_height, 1080);
     info.msaa_samples       = options.msaa;
