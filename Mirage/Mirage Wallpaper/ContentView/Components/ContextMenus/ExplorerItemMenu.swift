@@ -158,6 +158,16 @@ struct ExplorerItemMenu: SubviewOfContentView {
                         Label(LocalizedStringKey("移除快捷键"), systemImage: "command.square.fill")
                     }
                 }
+                if hoveredWallpaper.kind == .scene,
+                   let resources = Bundle.main.resourceURL,
+                   FileManager.default.fileExists(atPath: resources.appending(path: "SceneDiagnostics/manifest.json").path) {
+                    Button {
+                        wallpaperViewModel.diagnoseSceneColors(hoveredWallpaper)
+                    } label: {
+                        Label("场景颜色诊断", systemImage: "stethoscope")
+                    }
+                    .disabled(!canApply)
+                }
                 Button {
                     NSWorkspace.shared.selectFile(nil,
                                                   inFileViewerRootedAtPath: hoveredWallpaper.wallpaperDirectory.path(percentEncoded: false))

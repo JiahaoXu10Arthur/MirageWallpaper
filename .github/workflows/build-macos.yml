@@ -15,6 +15,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      scene_diagnostics:
+        description: Build the opt-in scene color diagnostic package
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -102,12 +107,22 @@ jobs:
           ./WebRenderer/scripts/build.sh release
           ./VideoRenderer/scripts/build.sh release
 
+      - name: Test scene diagnostics
+        shell: bash
+        run: python3 Mirage/Tests/run_scene_diagnostics.py
+
+      - name: Build controlled diagnostic libraries
+        if: github.event_name == 'workflow_dispatch' && inputs.scene_diagnostics
+        shell: bash
+        run: python3 Mirage/scripts/build_scene_diagnostics.py --output "$RUNNER_TEMP/SceneDiagnostics"
+
       - name: Build app bundle
         shell: bash
         env:
           MIRAGE_ARCH: ${{ matrix.arch }}
           MIRAGE_STEAM_WEB_API_KEY: ${{ secrets.MIRAGE_STEAM_WEB_API_KEY }}
           MIRAGE_GIT_COMMIT: ${{ github.sha }}
+          MIRAGE_SCENE_DIAGNOSTICS_DIR: ${{ inputs.scene_diagnostics && format('{0}/SceneDiagnostics', runner.temp) || '' }}
         run: ./Mirage/scripts/build.sh Release
 
       - name: Verify app bundle
@@ -169,7 +184,7 @@ jobs:
           set -euo pipefail
           build_number="$(git rev-list --count "$GITHUB_SHA")"
           short_commit="${GITHUB_SHA:0:12}"
-          package="Mirage-${build_number}-${short_commit}-macOS-${{ matrix.arch }}.zip"
+          package="Mirage-${build_number}-${short_commit}-macOS-${{ matrix.arch }}${{ inputs.scene_diagnostics && '-diagnostic' || '' }}.zip"
           ditto -c -k --sequesterRsrc --keepParent \
             "Mirage/dist/Mirage.app" "Mirage/dist/$package"
           shasum -a 256 "Mirage/dist/$package" > "Mirage/dist/$package.sha256"
@@ -179,7 +194,7 @@ jobs:
       - name: Upload package
         uses: actions/upload-artifact@v7
         with:
-          name: Mirage-${{ steps.package.outputs.build_number }}-macOS-${{ matrix.arch }}
+          name: Mirage-${{ steps.package.outputs.build_number }}-macOS-${{ matrix.arch }}${{ inputs.scene_diagnostics && '-diagnostic' || '' }}
           path: |
             Mirage/dist/${{ steps.package.outputs.package }}
             Mirage/dist/${{ steps.package.outputs.package }}.sha256

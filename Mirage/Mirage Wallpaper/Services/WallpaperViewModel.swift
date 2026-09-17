@@ -936,6 +936,46 @@ class WallpaperViewModel: PlaylistPlayback {
         }
     }
 
+    func diagnoseSceneColors(_ wallpaper: WEWallpaper) {
+        guard wallpaper.kind == .scene else { return }
+        Task { @MainActor in
+            await refreshScriptStorage(for: wallpaper)
+            guard let display = connectedDisplays.first(where: { renderer.currentWallpaper(onDisplay: $0.displayID)?.id == wallpaper.id })
+                    ?? connectedDisplays.first(where: \.isMain) ?? connectedDisplays.first else { return }
+            let runtime = loadRuntime(for: wallpaper)
+            let options = makeRenderOptions(for: wallpaper, runtime: runtime, assignmentID: UUID(), playbackAction: .keepRunning)
+            let bundle = Bundle.main
+            guard let resources = bundle.resourceURL else { return }
+            do {
+                let properties = try JSONSerialization.data(withJSONObject: WallpaperPropertyEncoding.values(options.userProperties), options: [.sortedKeys])
+                let snapshot = try JSONSerialization.data(withJSONObject: ["speed": runtime.speed,
+                    "scriptStorage": WallpaperRenderSnapshot.storedScriptStorage(for: wallpaper)])
+                var arguments = ["--fps", "30", "--display-id", String(display.displayID),
+                                 "--render-scale", String(options.renderScale), "--msaa", String(options.msaaSamples),
+                                 "--fill", options.fillMode.rawValue, "--position-x", String(options.position.x),
+                                 "--position-y", String(options.position.y)]
+                if options.loadFromMemory { arguments.append("--load-from-memory") }
+                SceneColorDiagnosticWindow.show(SceneDiagnosticRequest(
+                    package: wallpaper.resolvedEntryURL, assets: resources.appending(path: "assets"),
+                    renderer: resources.appending(path: "Renderers/SceneWallpaper"),
+                    frameworks: bundle.bundleURL.appending(path: "Contents/Frameworks"),
+                    payload: resources.appending(path: "SceneDiagnostics"), properties: properties, runtime: snapshot,
+                    arguments: arguments, metadata: ["version": bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
+                        "build": bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "",
+                        "commit": bundle.object(forInfoDictionaryKey: "MirageGitCommit") as? String ?? "",
+                        "wallpaper_id": wallpaper.id, "original_fps": String(options.fps),
+                        "original_spectrum": String(options.enableSpectrum)],
+                    fastMath: ProcessInfo.processInfo.environment["MVK_CONFIG_FAST_MATH_ENABLED"] ?? "default",
+                    metalFX: options.enableMetalFX))
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = L("场景颜色诊断")
+                alert.informativeText = error.localizedDescription
+                alert.runModal()
+            }
+        }
+    }
+
     private func makeRenderOptions(for w: WEWallpaper,
                                    runtime state: WallpaperRuntimeState,
                                    assignmentID: UUID,
