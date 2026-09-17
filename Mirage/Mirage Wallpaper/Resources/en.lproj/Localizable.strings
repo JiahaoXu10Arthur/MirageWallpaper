@@ -990,3 +990,8 @@
 "上一张" = "Previous Wallpaper";
 "下一张" = "Next Wallpaper";
 "正在应用壁纸…" = "Applying wallpaper…";
+
+"开发团队" = "Development Team";
+"项目作者 · 开发者" = "Project Author · Developer";
+"开发者" = "Developer";
+"打开 %@ 的 GitHub 主页" = "Open %@’s GitHub profile";

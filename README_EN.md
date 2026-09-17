@@ -26,6 +26,10 @@
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-GPL--3.0-blue"></a>
 </p>
 
+<p align="center">
+  <a href="#development-team">Development Team</a>
+</p>
+
 > [!IMPORTANT]
 > **Mirage is still in an early stage.** If you encounter a problem, please file a detailed [GitHub Issue](https://github.com/laobamac/MirageWallpaper/issues/new/choose) with your macOS/App version, reproduction steps, expected and actual results, and relevant logs. You can also join the QQ feedback group: **2160040437**.
 
@@ -276,6 +280,15 @@ Before submitting a change, verify at least that:
 2. `./scripts/build_all.sh` produces a complete App bundle.
 3. The App bundle contains all three renderers, runtime libraries, the MoltenVK ICD, and `assets`.
 4. No API keys, Steam sign-in data, build directories, or user wallpapers are committed.
+
+## Development Team
+
+| Name | Role | GitHub |
+| --- | --- | --- |
+| Xiaoci Wang | Project Author · Developer | [@laobamac](https://github.com/laobamac) |
+| Jiale Yu | Developer | [@dawalishi821](https://github.com/dawalishi821) |
+| Pikachu Ren | Developer | [@PIKACHUIM](https://github.com/PIKACHUIM) |
+| Yinan Qin | Developer | [@elysia-best](https://github.com/elysia-best) |
 
 ## Acknowledgements
 

@@ -21,6 +21,10 @@
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-GPL--3.0-blue"></a>
 </p>
 
+<p align="center">
+  <a href="#开发团队">开发团队</a>
+</p>
+
 > [!IMPORTANT]
 > **Mirage 当前仍处于早期阶段。** 如果遇到问题，请认真撰写 [GitHub Issue](https://github.com/laobamac/MirageWallpaper/issues/new/choose)，说明系统与 App 版本、复现步骤、预期结果、实际现象和相关日志；也可以加入 **QQ 交流群 2160040437** 反馈。
 
@@ -271,6 +275,15 @@ VideoRenderer/build/release/Tools/VideoViewer/VideoViewer <video-wallpaper-direc
 2. `./scripts/build_all.sh` 能生成完整 App Bundle；
 3. App Bundle 中包含三个渲染器、运行时动态库、MoltenVK ICD 和 `assets`；
 4. 没有提交 API Key、Steam 登录数据、构建目录或用户壁纸。
+
+## 开发团队
+
+| 姓名 | 身份 | GitHub |
+| --- | --- | --- |
+| Xiaoci Wang | 项目作者 · 开发者 | [@laobamac](https://github.com/laobamac) |
+| Jiale Yu | 开发者 | [@dawalishi821](https://github.com/dawalishi821) |
+| Pikachu Ren | 开发者 | [@PIKACHUIM](https://github.com/PIKACHUIM) |
+| Yinan Qin | 开发者 | [@elysia-best](https://github.com/elysia-best) |
 
 ## 鸣谢
 
