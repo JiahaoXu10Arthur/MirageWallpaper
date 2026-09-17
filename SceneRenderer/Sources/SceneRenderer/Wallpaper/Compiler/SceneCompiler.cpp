@@ -2,7 +2,6 @@ module;
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <sstream>
 
 #include <rstd/macro.hpp>
@@ -1288,14 +1287,6 @@ void WireCameraFieldScripts(ParseContext& context, const rstd::sync::Arc<SceneNo
 
 namespace
 {
-bool ForceLdrRenderTargets() {
-    static const bool forced = [] {
-        const char* raw = std::getenv("SCENERENDERER_FORCE_LDR_RT");
-        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
-    }();
-    return forced;
-}
-
 // Highest addressable material texture slot. The renderer only ever binds
 // g_Texture0..g_Texture12 (see WE_GLTEX_NAMES in sr.spec_texs), so a slot
 // index outside that range can never reach the GPU. Slot indices coming out
@@ -1589,7 +1580,7 @@ void ApplyEffectRenderTargetFormat(SceneRenderTarget& target, std::string_view f
         return;
     }
     if (format == "r16f" || format == "rg1616f") {
-        target.hdr_format           = ! ForceLdrRenderTargets();
+        target.hdr_format           = true;
         target.inherit_scene_format = false;
         return;
     }
@@ -3124,7 +3115,7 @@ void InitContext(ParseContext& context, fs::VFS& vfs, const wpscene::SceneMetada
     scene.ortho[0]  = ortho_extent[0];
     scene.ortho[1]  = ortho_extent[1];
     scene.hdr_enabled        = sc.general.hdr;
-    scene.hdr_render_targets = sc.general.hdr && ! ForceLdrRenderTargets();
+    scene.hdr_render_targets = sc.general.hdr;
     scene.SetProjectionKind(sc.general.isOrtho ? SceneProjectionKind::OrthographicCanvas
                                                 : SceneProjectionKind::Perspective3D);
     scene.SetViewportScale(sc.general.zoom);
