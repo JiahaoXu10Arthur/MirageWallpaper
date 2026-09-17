@@ -187,6 +187,19 @@ for bin in "$RENDERERS/SceneWallpaper" "$RENDERERS/WebWallpaper" "$RENDERERS/Vid
     retarget_bin "$bin"
 done
 
+if [ -n "${MIRAGE_SCENE_DIAGNOSTICS_DIR:-}" ]; then
+    DIAGNOSTICS="$RESOURCES/SceneDiagnostics"
+    test -f "$MIRAGE_SCENE_DIAGNOSTICS_DIR/manifest.json"
+    test ! -e "$DIAGNOSTICS"
+    cp -R "$MIRAGE_SCENE_DIAGNOSTICS_DIR" "$DIAGNOSTICS"
+    for variant in baseline patched; do
+        lib="$DIAGNOSTICS/$variant/libMoltenVK.dylib"
+        test -f "$lib"
+        sign_runtime_item "$lib"
+        codesign --verify --strict "$lib"
+    done
+fi
+
 rm -f "$COPIED_LIST"
 
 # library_path 相对 $RENDERERS/vulkan/icd.d。
