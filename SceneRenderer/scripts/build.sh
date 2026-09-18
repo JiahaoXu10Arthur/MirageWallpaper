@@ -104,7 +104,6 @@ LLVM_FORMULA="${LLVM_FORMULA:-llvm}"
 # Each entry: "formula|description"
 REQUIRED_FORMULAS=(
     "$LLVM_FORMULA|Clang 22 compiler (C++20 modules)"
-    "molten-vk|MoltenVK Vulkan ICD"
     "vulkan-loader|libvulkan loader"
     "vulkan-headers|Vulkan headers"
     "glslang|glslangValidator shader compiler"
