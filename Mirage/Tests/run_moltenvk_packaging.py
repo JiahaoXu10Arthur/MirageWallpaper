@@ -5,6 +5,7 @@ import copy
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import plistlib
 import subprocess
@@ -33,6 +34,70 @@ def manifest(mode="production"):
 
 
 class ProductionMoltenVKTests(unittest.TestCase):
+    def renderer_preflight(self, architecture, missing_loader=False):
+        with tempfile.TemporaryDirectory(prefix="mirage-build-preflight-") as temporary:
+            root = Path(temporary)
+            script = root / "SceneRenderer/scripts/build.sh"
+            script.parent.mkdir(parents=True)
+            script.write_text((PROJECT.parent / "SceneRenderer/scripts/build.sh").read_text())
+            preset = root / "scripts/preset.sh"
+            preset.parent.mkdir()
+            preset.write_text((PROJECT.parent / "scripts/preset.sh").read_text())
+            tools = root / "bin"
+            tools.mkdir()
+            prefix = root / "brew prefix"
+            compilers = prefix / "opt/llvm@22/bin"
+            compilers.mkdir(parents=True)
+            commands = {
+                "uname": 'if [ "$1" = "-s" ]; then printf "Darwin\\n"; else printf "%s\\n" "$TEST_ARCH"; fi',
+                "brew": '''case "$1" in
+    --prefix)
+        if [ "$#" -eq 1 ]; then printf '%s\\n' "$TEST_BREW_PREFIX";
+        else printf '%s/opt/%s\\n' "$TEST_BREW_PREFIX" "$2"; fi ;;
+    list)
+        printf '%s\\n' llvm@22 vulkan-headers glslang glfw freetype fontconfig lz4 ffmpeg
+        if [ "$TEST_MISSING_LOADER" = 0 ]; then printf 'vulkan-loader\\n'; fi ;;
+    *) exit 2 ;;
+esac''',
+                "cmake": 'printf "%s\\n" "$@" > "$TEST_CMAKE_LOG"',
+                "ninja": "exit 0",
+                "pkg-config": "exit 0",
+                "glslangValidator": "exit 0",
+            }
+            for name, body in commands.items():
+                executable = tools / name
+                executable.write_text("#!/bin/bash\n" + body + "\n")
+                executable.chmod(0o755)
+            for name in ("clang", "clang++"):
+                executable = compilers / name
+                executable.write_text("#!/bin/bash\nexit 0\n")
+                executable.chmod(0o755)
+            log = root / "cmake.log"
+            env = os.environ.copy()
+            env.pop("BUILD_PRESET", None)
+            env.update(PATH=str(tools) + os.pathsep + env.get("PATH", ""),
+                       LLVM_FORMULA="llvm@22", JOBS="1", TEST_ARCH=architecture,
+                       TEST_BREW_PREFIX=str(prefix), TEST_CMAKE_LOG=str(log),
+                       TEST_MISSING_LOADER="1" if missing_loader else "0")
+            result = subprocess.run(["/bin/bash", str(script), "configure"], env=env,
+                                    text=True, capture_output=True, timeout=20)
+            return result, log.read_text() if log.exists() else ""
+
+    def test_renderer_preflight_without_homebrew_moltenvk(self):
+        for architecture, preset in [("arm64", "macos-arm64-clang-release"),
+                                     ("x86_64", "macos-clang-release")]:
+            with self.subTest(architecture=architecture):
+                result, arguments = self.renderer_preflight(architecture)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(preset, arguments)
+                self.assertNotIn("missing Homebrew formula: molten-vk", result.stderr)
+
+    def test_renderer_preflight_requires_vulkan_loader(self):
+        result, arguments = self.renderer_preflight("arm64", missing_loader=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing Homebrew formula: vulkan-loader", result.stderr)
+        self.assertEqual(arguments, "")
+
     def test_exact_patch_and_scope(self):
         source = "before\n" + build.ORIGINAL + "\nafter"
         self.assertEqual(build.patch_source(source), "before\n" + build.PATCHED + "\nafter")

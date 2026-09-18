@@ -98,6 +98,10 @@ jobs:
           brew install cmake ninja pkg-config llvm@22 vulkan-loader \
             vulkan-headers glslang glfw freetype fontconfig lz4 ffmpeg
 
+      - name: Test production MoltenVK packaging
+        shell: bash
+        run: python3 Mirage/Tests/run_moltenvk_packaging.py
+
       - name: Build renderers
         shell: bash
         env:
@@ -110,10 +114,6 @@ jobs:
       - name: Test scene diagnostics
         shell: bash
         run: python3 Mirage/Tests/run_scene_diagnostics.py
-
-      - name: Test production MoltenVK packaging
-        shell: bash
-        run: python3 Mirage/Tests/run_moltenvk_packaging.py
 
       - name: Build protected production MoltenVK
         shell: bash
