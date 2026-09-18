@@ -48,8 +48,9 @@ if [ "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$CONTENTS/Info.pl
     EXTENSION_ENTITLEMENTS="$ROOT/Mirage/Mirage Wallpaper Extension/MirageWallpaperExtension.Development.entitlements"
 fi
 
-BREW_PREFIX="$(brew --prefix)"
-MOLTENVK="$BREW_PREFIX/opt/molten-vk/lib/libMoltenVK.dylib"
+MOLTENVK_DIR="${MIRAGE_MOLTENVK_DIR:-$ROOT/Mirage/build/MoltenVK-1.4.2-color-transfer-v1}"
+python3 "$ROOT/Mirage/scripts/build_moltenvk.py" --mode production --output "$MOLTENVK_DIR"
+MOLTENVK="$MOLTENVK_DIR/libMoltenVK.dylib"
 
 echo "[bundle] App:  $APP"
 echo "[bundle] Root: $ROOT"
@@ -125,12 +126,12 @@ echo "[bundle] 收集视频引擎依赖..."
 collect_deps "$RENDERERS/VideoWallpaper"
 
 MVK_BASE=$(basename "$MOLTENVK")
+cp -f "$MOLTENVK" "$FRAMEWORKS/$MVK_BASE"
+chmod u+w "$FRAMEWORKS/$MVK_BASE"
 if ! is_copied "$MVK_BASE"; then
-    cp -f "$(resolve "$MOLTENVK")" "$FRAMEWORKS/$MVK_BASE"
-    chmod u+w "$FRAMEWORKS/$MVK_BASE"
     mark_copied "$MVK_BASE"
-    collect_deps "$FRAMEWORKS/$MVK_BASE"
 fi
+collect_deps "$FRAMEWORKS/$MVK_BASE"
 
 echo "[bundle] 已内嵌 $(wc -l < "$COPIED_LIST" | tr -d ' ') 个 dylib"
 
@@ -349,6 +350,8 @@ for executable in "$APP/Contents/MacOS"/*.dylib; do
     [ -f "$executable" ] || continue
     sign_item "$executable"
 done
+python3 "$ROOT/Mirage/scripts/build_moltenvk.py" --record-bundle "$APP" --output "$MOLTENVK_DIR"
 codesign --force "${SIGN_ARGS[@]}" --entitlements "$APP_ENTITLEMENTS" --sign "$SIGN_IDENTITY" "$APP"
+python3 "$ROOT/Mirage/scripts/build_moltenvk.py" --verify-bundle "$APP"
 
 echo "[bundle] 完成"

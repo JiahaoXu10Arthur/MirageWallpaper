@@ -14,11 +14,12 @@ import time
 sys.dont_write_bytecode = True
 
 
-def native_capture(project, libraries, wallpaper):
+def native_capture(project, libraries, wallpaper, production=False):
     root = Path(tempfile.mkdtemp(prefix="mirage-native-color-diagnostics-"))
     (root / "runtime.json").write_text(json.dumps(dict(speed=1, scriptStorage={})))
     print(f"Native capture output: {root}", flush=True)
-    for variant, metalfx in [("baseline", False), ("patched", False), ("baseline", True)]:
+    variants = [("production", False), ("production", True)] if production else [("baseline", False), ("patched", False), ("baseline", True)]
+    for variant, metalfx in variants:
         name = variant + ("-metalfx" if metalfx else "")
         out = root / name
         out.mkdir()
@@ -26,13 +27,15 @@ def native_capture(project, libraries, wallpaper):
         cache.mkdir()
         icd = cache / "icd.json"
         icd.write_text(json.dumps(dict(file_format_version="1.0.0", ICD=dict(
-            library_path=str(libraries.resolve() / variant / "libMoltenVK.dylib"),
+            library_path=str(libraries.resolve() / "libMoltenVK.dylib" if production else libraries.resolve() / variant / "libMoltenVK.dylib"),
             api_version="1.4.0", is_portability_driver=True))))
         env = os.environ.copy()
         env.update(RSTD_LOG="info", MVK_CONFIG_FAST_MATH_ENABLED="0", VK_DRIVER_FILES=str(icd), VK_ICD_FILENAMES=str(icd),
                    SCENERENDERER_DIAGNOSTICS_DIR=str(out), SCENERENDERER_DIAGNOSTIC_CACHE=str(cache / "pipeline"),
                    SCENERENDERER_DUMP_FRAME=str(out / "frame.ppm"), SCENERENDERER_DUMP_FRAME_AT="0",
                    SCENERENDERER_DUMP_PRESENT=str(out / "present.ppm"))
+        if production:
+            env.pop("MVK_CONFIG_FAST_MATH_ENABLED", None)
         command = [str(project.parent / "SceneRenderer/build/macos-clang-release/Tools/SceneWallpaper/SceneWallpaper"),
                    str(project.parent / "assets"), str(wallpaper.resolve()), "--fps", "30", "--resolution", "800x520",
                    "--muted", "--external-spectrum", "--runtime", str(root / "runtime.json"), "--cache-path", str(cache), "--run-seconds", "110"]
@@ -73,13 +76,14 @@ def native_capture(project, libraries, wallpaper):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--native", action="store_true")
+    parser.add_argument("--production", action="store_true")
     parser.add_argument("--libraries", type=Path)
     parser.add_argument("--wallpaper", type=Path)
     args = parser.parse_args()
     if args.native and (args.libraries is None or args.wallpaper is None):
         parser.error("--native requires --libraries and --wallpaper")
     project = Path(__file__).resolve().parents[1]
-    spec = importlib.util.spec_from_file_location("diagnostic_builder", project / "scripts/build_scene_diagnostics.py")
+    spec = importlib.util.spec_from_file_location("diagnostic_builder", project / "scripts/build_moltenvk.py")
     builder = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(builder)
     fixture = "prefix\n" + builder.ORIGINAL + "\nsuffix"
@@ -107,7 +111,7 @@ def main():
         subprocess.run([str(binary)], check=True, timeout=45)
     print("Build-source guards and three localization catalogs passed", flush=True)
     if args.native:
-        native_capture(project, args.libraries, args.wallpaper)
+        native_capture(project, args.libraries, args.wallpaper, args.production)
 
 
 if __name__ == "__main__":
