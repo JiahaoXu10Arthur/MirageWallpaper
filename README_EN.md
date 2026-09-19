@@ -155,8 +155,10 @@ Install dependencies:
 ```bash
 xcode-select --install
 brew install cmake ninja pkg-config llvm molten-vk vulkan-loader vulkan-headers \
-  glslang glfw freetype fontconfig lz4 ffmpeg
+  glslang glfw freetype fontconfig lz4 ffmpeg dav1d nasm
 ```
+
+Renderer scripts automatically build a pinned decoder-only FFmpeg. Homebrew FFmpeg is used only to generate test media and is not bundled. dav1d supplies AV1 decoding; nasm supplies Intel assembly support.
 
 ## Build from Source
 

@@ -150,8 +150,10 @@ Mirage 会解析作品声明的入口文件，并对部分非标准目录布局�
 ```bash
 xcode-select --install
 brew install cmake ninja pkg-config llvm molten-vk vulkan-loader vulkan-headers \
-  glslang glfw freetype fontconfig lz4 ffmpeg
+  glslang glfw freetype fontconfig lz4 ffmpeg dav1d nasm
 ```
+
+渲染器构建脚本会自动构建固定版本的仅解码 FFmpeg；Homebrew FFmpeg 只用于生成测试媒体，不会打入应用。dav1d 用于 AV1 解码，nasm 用于 Intel 汇编优化。
 
 ## 从源码构建
 
