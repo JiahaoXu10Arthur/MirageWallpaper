@@ -175,14 +175,14 @@ retarget_lib() {
         local db
         db=$(basename "$(resolve "$dep")")
         if [ -f "$FRAMEWORKS/$db" ]; then
-            install_name_tool -change "$dep" "@rpath/$db" "$lib" 2>/dev/null || true
+            install_name_tool -change "$dep" "@loader_path/$db" "$lib"
         fi
     done <<< "$deps"
 }
 
 echo "[bundle] 重写内嵌库的 install name..."
 for lib in "$FRAMEWORKS"/*.dylib; do
-    [ -f "$lib" ] || continue
+    [ -f "$lib" ] && [ ! -L "$lib" ] || continue
     retarget_lib "$lib"
 done
 install_name_tool -add_rpath "@loader_path" "$FRAMEWORKS/libMirageSceneSaver.dylib" 2>/dev/null || true

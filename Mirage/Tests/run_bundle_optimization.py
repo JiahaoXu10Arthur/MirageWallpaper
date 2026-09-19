@@ -1,6 +1,8 @@
 __copyright__ = "Copyright © 2026 王孝慈. All rights reserved."
 
 import hashlib
+import os
+import re
 import argparse
 import uuid
 import importlib.util
@@ -12,6 +14,7 @@ import subprocess
 import tempfile
 import unittest
 import sys
+from unittest.mock import Mock, patch
 sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,6 +23,9 @@ APP_PATH = None
 SPEC = importlib.util.spec_from_file_location('runtime_manifest', ROOT / 'Mirage/scripts/scene_runtime_manifest.py')
 RUNTIME = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RUNTIME)
+CODEC_SPEC = importlib.util.spec_from_file_location('codec_packaging', ROOT / 'Mirage/Tests/run_codec_packaging.py')
+CODECS = importlib.util.module_from_spec(CODEC_SPEC)
+CODEC_SPEC.loader.exec_module(CODECS)
 
 
 class PackagingTests(unittest.TestCase):
@@ -122,6 +128,53 @@ class PackagingTests(unittest.TestCase):
         subprocess.run(['xcrun', 'swiftc', ROOT / 'Mirage/Tests/SharedRuntimeSandboxProbe.swift', '-parse-as-library', '-o', executable], check=True, timeout=90)
         subprocess.run(['codesign', '--force', '--sign', '-', '--entitlements', entitlements, extension], check=True, timeout=30)
         subprocess.run([executable], check=True, timeout=30)
+
+    def test_relocated_library_loads_without_host_runpaths(self):
+        original = self.root / 'original'
+        frameworks = self.root / 'relocated package/Frameworks'
+        original.mkdir()
+        frameworks.mkdir(parents=True)
+        dependency = original / 'libfixture_dependency.1.0.dylib'
+        (original / 'dependency.c').write_text('int fixture_value(void) { return 42; }\n')
+        (original / 'consumer.c').write_text('extern int fixture_value(void); int fixture_read(void) { return fixture_value(); }\n')
+        subprocess.run(['xcrun', 'clang', '-dynamiclib', original / 'dependency.c', '-o', dependency,
+                        '-Wl,-headerpad_max_install_names', '-install_name', str(original / 'libfixture_dependency.1.dylib')], check=True, timeout=60)
+        (original / 'libfixture_dependency.1.dylib').symlink_to(dependency.name)
+        library = original / 'libfixture_consumer.dylib'
+        subprocess.run(['xcrun', 'clang', '-dynamiclib', original / 'consumer.c', dependency, '-o', library,
+                        '-Wl,-headerpad_max_install_names', '-install_name', str(library)], check=True, timeout=60)
+        for path in [dependency, library]:
+            shutil.copy2(path, frameworks / path.name)
+        script = (ROOT / 'Mirage/scripts/bundle_renderers.sh').read_text()
+        functions = []
+        for name in ['is_bundleable', 'resolve', 'remove_build_rpaths', 'retarget_lib']:
+            match = re.search(r'^' + name + r'\(\) \{\n.*?^\}', script, re.MULTILINE | re.DOTALL)
+            self.assertIsNotNone(match, name)
+            functions.append(match.group())
+        shell = 'set -euo pipefail\n' + '\n'.join(functions) + '\nFRAMEWORKS="$1"\nretarget_lib "$2"\n'
+        consumer = frameworks / library.name
+        subprocess.run(['bash', '-c', shell, 'retarget-test', frameworks, consumer], check=True, timeout=30)
+        shutil.rmtree(original)
+        for path in frameworks.glob('*.dylib'):
+            subprocess.run(['codesign', '--force', '--sign', '-', path], check=True, capture_output=True, timeout=20)
+        environment = {key: value for key, value in os.environ.items() if not key.startswith('DYLD_')}
+        probe = 'import ctypes,sys; lib=ctypes.CDLL(sys.argv[1]); assert lib.fixture_read() == 42'
+        subprocess.run(['/usr/bin/python3', '-c', probe, consumer], env=environment, check=True, timeout=20)
+
+    def test_codec_provenance_rejects_external_library(self):
+        libraries = self.root / 'bundled'
+        libraries.mkdir()
+        dyld = Mock()
+        dyld._dyld_image_count.return_value = 3
+        images = [libraries / 'libavcodec.1.dylib', libraries / 'libavformat.1.dylib',
+                  self.root / 'outside/libavutil.1.dylib']
+        dyld._dyld_get_image_name.side_effect = [os.fsencode(path) for path in images]
+        with patch.object(CODECS.ctypes, 'CDLL', return_value=dyld):
+            with self.assertRaisesRegex(RuntimeError, 'external dependency'):
+                CODECS.verify_loaded_codec_paths(libraries)
+        dyld._dyld_get_image_name.side_effect = [os.fsencode(libraries / path.name) for path in images]
+        with patch.object(CODECS.ctypes, 'CDLL', return_value=dyld):
+            CODECS.verify_loaded_codec_paths(libraries)
 
     def test_component_lookup(self):
         binary = self.root / 'lookup'

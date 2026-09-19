@@ -21,12 +21,54 @@ def run(command, **kwargs):
     return result
 
 
+def verify_loader_paths(libraries):
+    for pattern in ('libavcodec.*.*.*.dylib', 'libavformat.*.*.*.dylib', 'libavutil.*.*.*.dylib',
+                    'libswresample.*.*.*.dylib', 'libswscale.*.*.*.dylib', 'libdav1d.*.dylib'):
+        for path in libraries.glob(pattern):
+            if path.is_symlink():
+                continue
+            linked = subprocess.check_output(['otool', '-L', str(path)], text=True).splitlines()[2:]
+            for line in linked:
+                dependency = line.strip().split(' (compatibility')[0]
+                if dependency.startswith(('/usr/lib/', '/System/')):
+                    continue
+                if not dependency.startswith('@loader_path/'):
+                    raise RuntimeError(f'Codec dependency does not resolve beside its loader: {path.name}: {dependency}')
+                target = (path.parent / dependency[len('@loader_path/'):]).resolve()
+                if not target.is_file() or not target.is_relative_to(libraries.resolve()):
+                    raise RuntimeError(f'Codec dependency is missing or escapes its bundle: {path.name}: {dependency}')
+
+
+def verify_loaded_codec_paths(libraries):
+    dyld = ctypes.CDLL(None)
+    dyld._dyld_image_count.argtypes = []
+    dyld._dyld_image_count.restype = ctypes.c_uint32
+    dyld._dyld_get_image_name.argtypes = [ctypes.c_uint32]
+    dyld._dyld_get_image_name.restype = ctypes.c_char_p
+    prefixes = ('libavcodec.', 'libavformat.', 'libavutil.', 'libswresample.', 'libswscale.', 'libdav1d.')
+    loaded = set()
+    for index in range(dyld._dyld_image_count()):
+        name = dyld._dyld_get_image_name(index)
+        if not name:
+            continue
+        path = Path(os.fsdecode(name)).resolve()
+        if path.name.startswith(prefixes):
+            if not path.is_relative_to(libraries.resolve()):
+                raise RuntimeError(f'Codec test loaded an external dependency: {path}')
+            loaded.add(path.name)
+    if not any(name.startswith('libavcodec.') for name in loaded) or not any(name.startswith('libavformat.') for name in loaded):
+        raise RuntimeError('Loaded codec images could not be verified')
+    print(f'PASS: all {len(loaded)} loaded codec libraries originate inside the bundle', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--app', type=Path)
     args = parser.parse_args()
     prefix = ROOT / 'Mirage/build/ffmpeg' / platform.machine()
     libraries = args.app.resolve() / 'Contents/Extensions/MirageWallpaperExtension.appex/Contents/Frameworks' if args.app else prefix / 'lib'
+    if args.app:
+        verify_loader_paths(libraries)
     codec_path = next(p for p in libraries.glob('libavcodec.*.*.*.dylib') if not p.is_symlink())
     codec = ctypes.CDLL(str(codec_path))
     codec.av_codec_iterate.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
@@ -42,6 +84,8 @@ def main():
     config = codec.avcodec_configuration().decode()
     assert '--disable-network' in config and '--disable-encoders' in config
     fmt = ctypes.CDLL(str(next(p for p in libraries.glob('libavformat.*.*.*.dylib') if not p.is_symlink())))
+    if args.app:
+        verify_loaded_codec_paths(libraries)
     fmt.avio_enum_protocols.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
     fmt.avio_enum_protocols.restype = ctypes.c_char_p
     cursor = ctypes.c_void_p()
