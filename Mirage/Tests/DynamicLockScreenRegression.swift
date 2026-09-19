@@ -523,9 +523,7 @@ private struct DynamicLockScreenRegression {
         ], format: .xml, options: 0)
         let files: [String: Data] = [
             "Contents/Info.plist": info,
-            "Contents/MacOS/MirageWallpaperExtension": Data("executable fixture".utf8),
-            "Contents/Frameworks/libMirageSceneSaver.dylib": Data("renderer fixture".utf8),
-            "Contents/Resources/vulkan/icd.d/MoltenVK_icd.json": Data("{}".utf8)
+            "Contents/MacOS/MirageWallpaperExtension": Data("executable fixture".utf8)
         ]
         for (path, data) in files {
             let url = extensionURL.appendingPathComponent(path)
@@ -533,6 +531,12 @@ private struct DynamicLockScreenRegression {
             try data.write(to: url)
         }
         try FileManager.default.createDirectory(at: extensionURL.appendingPathComponent("Contents/Resources/assets"), withIntermediateDirectories: true)
+        for path in ["Contents/Frameworks/libMirageSceneSaver.dylib", "Contents/Resources/vulkan/icd.d/MoltenVK_icd.json",
+                     "Contents/Resources/MoltenVK/manifest.json", "Contents/Resources/scene-runtime.json"] {
+            let url = extensionURL.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("fixture".utf8).write(to: url)
+        }
         let display = MirageLockDisplayConfiguration(displayID: 7, wallpaperID: "preserved-video",
             title: "Preserved video", kind: "video", renderDirectory: root.path,
             entryPath: root.appendingPathComponent("video.mp4").path, previewPath: nil,
@@ -542,6 +546,16 @@ private struct DynamicLockScreenRegression {
         let configurationURL = root.appendingPathComponent(MirageLockBridge.configurationName)
         try configuration.write(to: configurationURL)
         let fingerprint = try MirageLockBridge.fingerprint(at: extensionURL)
+        let shared = extensionURL.appendingPathComponent("Contents/Resources/scene-runtime.json")
+        try Data("updated dependency".utf8).write(to: shared)
+        let updatedFingerprint = try MirageLockBridge.fingerprint(at: extensionURL)
+        try require(updatedFingerprint != fingerprint, "Shared runtime updates did not invalidate the extension")
+        try FileManager.default.removeItem(at: shared)
+        do {
+            _ = try MirageLockBridge.fingerprint(at: extensionURL)
+            try require(false, "Missing shared runtime was accepted")
+        } catch is CocoaError { }
+        try Data("fixture".utf8).write(to: shared)
         let normal = RegistrySimulation()
         for _ in 0..<20 {
             let registration = try WallpaperExtensionController.register(appURL: app, extensionURL: extensionURL,

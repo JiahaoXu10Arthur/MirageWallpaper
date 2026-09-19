@@ -5,6 +5,7 @@ import copy
 import importlib.util
 import io
 import json
+import shutil
 import os
 from pathlib import Path
 import plistlib
@@ -43,6 +44,12 @@ class ProductionMoltenVKTests(unittest.TestCase):
             preset = root / "scripts/preset.sh"
             preset.parent.mkdir()
             preset.write_text((PROJECT.parent / "scripts/preset.sh").read_text())
+            ffmpeg = root / "scripts/build_ffmpeg.sh"
+            ffmpeg.write_text("#!/bin/bash\nexit 0\n")
+            ffmpeg.chmod(0o755)
+            pc = root / "Mirage/build/ffmpeg" / architecture / "lib/pkgconfig/libavcodec.pc"
+            pc.parent.mkdir(parents=True)
+            pc.touch()
             tools = root / "bin"
             tools.mkdir()
             prefix = root / "brew prefix"
@@ -55,7 +62,7 @@ class ProductionMoltenVKTests(unittest.TestCase):
         if [ "$#" -eq 1 ]; then printf '%s\\n' "$TEST_BREW_PREFIX";
         else printf '%s/opt/%s\\n' "$TEST_BREW_PREFIX" "$2"; fi ;;
     list)
-        printf '%s\\n' llvm@22 vulkan-headers glslang glfw freetype fontconfig lz4 ffmpeg
+        printf '%s\\n' llvm@22 vulkan-headers glslang glfw freetype fontconfig lz4 dav1d
         if [ "$TEST_MISSING_LOADER" = 0 ]; then printf 'vulkan-loader\\n'; fi ;;
     *) exit 2 ;;
 esac''',
@@ -186,24 +193,35 @@ esac''',
             (app / "Contents/MacOS").mkdir(parents=True)
             (app / "Contents/MacOS/Mirage").write_bytes(b"executable")
             (app / "Contents/Info.plist").write_bytes(plistlib.dumps(dict(CFBundleExecutable="Mirage")))
-            components = ["", "Contents/Resources/Screen Savers/MirageScreenSaver.saver",
+            components = ["Contents/Resources/Screen Savers/MirageScreenSaver.saver",
                           "Contents/Resources/Screen Savers/MirageDynamicLockScreen.saver",
                           "Contents/Extensions/MirageWallpaperExtension.appex"]
+            library = app / components[-1] / "Contents/Frameworks/libMoltenVK.dylib"
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b"protected")
+            link = app / "Contents/Frameworks/libMoltenVK.dylib"
+            link.parent.mkdir(parents=True)
+            link.symlink_to("../Extensions/MirageWallpaperExtension.appex/Contents/Frameworks/libMoltenVK.dylib")
+            shared_icd = app / components[-1] / "Contents/Resources/vulkan/icd.d/MoltenVK_icd.json"
+            shared_icd.parent.mkdir(parents=True)
+            shared_icd.write_text(json.dumps(dict(ICD=dict(library_path="../../../Frameworks/libMoltenVK.dylib"))))
+            icd = app / "Contents/Resources/Renderers/vulkan/icd.d/MoltenVK_icd.json"
+            icd.parent.mkdir(parents=True)
+            icd.write_text(json.dumps(dict(ICD=dict(library_path="../../../../Frameworks/libMoltenVK.dylib"))))
             for component in components:
-                library = app / component / "Contents/Frameworks/libMoltenVK.dylib"
-                library.parent.mkdir(parents=True)
-                library.write_bytes(b"protected")
-                icd = app / component / ("Contents/Resources/vulkan/icd.d/MoltenVK_icd.json" if component
-                                         else "Contents/Resources/Renderers/vulkan/icd.d/MoltenVK_icd.json")
-                icd.parent.mkdir(parents=True)
-                relative = "../../../Frameworks/libMoltenVK.dylib" if component else "../../../../Frameworks/libMoltenVK.dylib"
-                icd.write_text(json.dumps(dict(ICD=dict(library_path=relative))))
+                (app / component / "Contents/MacOS").mkdir(parents=True)
             with patch.object(build, "library_uuids", return_value=UUIDS):
                 build.verify_bundle(app, payload)
                 build.verify_bundle(app)
                 document = json.loads((app / "Contents/Resources/MoltenVK/manifest.json").read_text())
-                self.assertEqual(len(document["bundled_libraries"]), 4)
-                bad = app / components[-1] / "Contents/Frameworks/libMoltenVK.dylib"
+                self.assertEqual(len(document["bundled_libraries"]), 1)
+                duplicate = app / components[0] / "Contents/Frameworks/libMoltenVK.dylib"
+                duplicate.parent.mkdir(parents=True)
+                duplicate.write_bytes(b"protected")
+                with self.assertRaises(ValueError):
+                    build.verify_bundle(app)
+                shutil.rmtree(duplicate.parent)
+                bad = library
                 bad.write_bytes(b"changed after packaging")
                 with self.assertRaises(ValueError):
                     build.verify_bundle(app)
