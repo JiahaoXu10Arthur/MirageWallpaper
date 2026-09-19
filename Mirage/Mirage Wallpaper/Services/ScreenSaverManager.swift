@@ -74,7 +74,6 @@ final class ScreenSaverManager {
     private let wallpaperAgentBundleIdentifier = "com.apple.wallpaper.agent"
     private let fingerprintResourcePaths = [
         "Contents/Info.plist",
-        "Contents/Frameworks/libMirageSceneSaver.dylib",
         "Contents/Resources/thumbnail.png",
         "Contents/Resources/thumbnail@2x.png"
     ]
@@ -199,6 +198,7 @@ final class ScreenSaverManager {
             path: ".\(installedURL.deletingPathExtension().lastPathComponent)-\(UUID().uuidString).saver")
         defer { try? fm.removeItem(at: stagingURL) }
         try fm.copyItem(at: bundledURL, to: stagingURL)
+        try recordHostApplication()
         let expectedFingerprint = try validatedFingerprint(
             of: stagingURL,
             bundleIdentifier: bundleIdentifier,
@@ -241,7 +241,16 @@ final class ScreenSaverManager {
     /// The screen saver is copied out of the app bundle, so replacing Mirage.app
     /// alone cannot update an already installed saver. Keep an existing user
     /// installation aligned with the newly updated app on the next launch.
+    private func recordHostApplication() throws {
+        let url = configurationURL.deletingLastPathComponent().appending(path: "screen-saver-host.json")
+        let record = ["path": Bundle.main.bundleURL.standardizedFileURL.path,
+                      "bundleIdentifier": Bundle.main.bundleIdentifier ?? "cn.laobamac.Mirage"]
+        try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: record, options: .sortedKeys).write(to: url, options: .atomic)
+    }
+
     func refreshInstalledVersionIfNeeded() {
+        if isInstalled || isDynamicLockScreenInstalled { try? recordHostApplication() }
         discardUnsupportedConfiguration()
         refreshInstalledComponent(
             installedURL: installedURL,
@@ -451,7 +460,8 @@ final class ScreenSaverManager {
             "positionsByDisplay": context.positions.mapValues(\.dictionary),
             "enableHDRVideo": context.enableHDRVideo,
             "loadFromMemory": context.loadFromMemory,
-            "language": context.language
+            "language": context.language,
+            "hostApplicationPath": Bundle.main.bundleURL.standardizedFileURL.path
         ]
         if let source = context.sourceDisplayKey { object["sourceDisplayKey"] = source }
         if let existing {

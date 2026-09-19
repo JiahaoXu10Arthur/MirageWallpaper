@@ -25,6 +25,7 @@ private struct MirageSaverConfiguration {
     let language: String
     let speed: Float
     let scriptStorage: [String: String]
+    let hostApplicationPath: String?
     let identity: Data
 
     static func load(displayKey: String? = nil) -> Self? {
@@ -90,6 +91,7 @@ private struct MirageSaverConfiguration {
             language: object["language"] as? String ?? Locale.preferredLanguages.first ?? "en",
             speed: speed,
             scriptStorage: object["scriptStorage"] as? [String: String] ?? [:],
+            hostApplicationPath: object["hostApplicationPath"] as? String,
             identity: identity
         )
     }
@@ -160,9 +162,7 @@ private final class MirageSceneLibrary {
     let setFirstFrame: SetFirstFrame
     let destroy: Destroy
 
-    init?(bundle: Bundle) {
-        guard let frameworkDirectory = bundle.privateFrameworksURL else { return nil }
-        let libraryURL = frameworkDirectory.appendingPathComponent("libMirageSceneSaver.dylib")
+    init?(libraryURL: URL) {
         guard let handle = dlopen(libraryURL.path, RTLD_NOW | RTLD_LOCAL) else { return nil }
         guard let createSymbol = dlsym(handle, "MirageSceneSaverCreateWithRuntime"),
               let pauseSymbol = dlsym(handle, "MirageSceneSaverSetPaused"),
@@ -261,17 +261,15 @@ private final class MirageSaverSceneSession {
         Self.queue.async { [weak self] in
             let failure: String? = autoreleasepool {
                 guard !request.isCancelled else { return nil }
-                guard let directory = bundle.resourceURL,
-                      let library = MirageSceneLibrary(bundle: bundle) else {
+                guard let host = MirageHostApplication.locate(configuredPath: configuration.hostApplicationPath, component: bundle) else {
+                    return "场景屏保资源不完整"
+                }
+                guard let library = MirageSceneLibrary(libraryURL: host.sceneLibraryURL) else {
                     return "场景屏保组件不可用"
                 }
                 resources.library = library
-                let assets = directory.appendingPathComponent("assets", isDirectory: true)
-                let icd = directory.appendingPathComponent("vulkan/icd.d/MoltenVK_icd.json")
-                guard FileManager.default.fileExists(atPath: assets.path),
-                      FileManager.default.fileExists(atPath: icd.path) else {
-                    return "场景屏保资源不完整"
-                }
+                let assets = host.assetsURL
+                let icd = host.vulkanICDURL
                 guard !request.isCancelled else { return nil }
                 setenv("VK_ICD_FILENAMES", icd.path, 1)
                 setenv("VK_DRIVER_FILES", icd.path, 1)

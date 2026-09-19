@@ -12,6 +12,24 @@ import Darwin
 import Foundation
 import ImageIO
 
+private enum MirageHostApplication {
+    static var contentsURL: URL {
+        Bundle.main.bundleURL.appendingPathComponent("Contents", isDirectory: true)
+    }
+
+    static var sceneLibraryURL: URL {
+        contentsURL.appendingPathComponent("Frameworks/libMirageSceneSaver.dylib")
+    }
+
+    static var assetsURL: URL {
+        contentsURL.appendingPathComponent("Resources/assets", isDirectory: true)
+    }
+
+    static var vulkanICDURL: URL {
+        contentsURL.appendingPathComponent("Resources/vulkan/icd.d/MoltenVK_icd.json")
+    }
+}
+
 private final class MirageSceneLibrary {
     typealias Create = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafePointer<CChar>?, UnsafePointer<CChar>?, UInt32, UInt32, UInt32, UnsafePointer<CChar>?, Double, Double, UnsafePointer<CChar>?) -> UnsafeMutableRawPointer?
     typealias SetPaused = @convention(c) (UnsafeMutableRawPointer?, Int32) -> Void
@@ -26,10 +44,7 @@ private final class MirageSceneLibrary {
     let destroy: Destroy
 
     init?() {
-        let candidates = [
-            Bundle.main.bundleURL.appendingPathComponent("Contents/Frameworks/libMirageSceneSaver.dylib"),
-            Bundle.main.privateFrameworksURL?.appendingPathComponent("libMirageSceneSaver.dylib"),
-        ].compactMap { $0 }
+        let candidates = [MirageHostApplication.sceneLibraryURL]
         for url in candidates where FileManager.default.fileExists(atPath: url.path) {
             guard let handle = dlopen(url.path, RTLD_NOW | RTLD_LOCAL),
                   let create = dlsym(handle, "MirageSceneDesktopCreateWithRuntime"),
@@ -221,15 +236,15 @@ final class MirageLockRenderer {
     }
 
     private func loadScene(_ configuration: MirageLockDisplayConfiguration, size: CGSize) {
-        guard let assetsURL = Bundle.main.resourceURL?.appendingPathComponent("assets", isDirectory: true),
-              FileManager.default.fileExists(atPath: assetsURL.path),
+        let assetsURL = MirageHostApplication.assetsURL
+        guard FileManager.default.fileExists(atPath: assetsURL.path),
               let library = MirageSceneLibrary() else {
             NSLog("[MirageLock] scene runtime unavailable")
             reportFailure("Scene runtime is unavailable")
             return
         }
-        guard let icdURL = Bundle.main.resourceURL?.appendingPathComponent("vulkan/icd.d/MoltenVK_icd.json"),
-              FileManager.default.fileExists(atPath: icdURL.path) else {
+        let icdURL = MirageHostApplication.vulkanICDURL
+        guard FileManager.default.fileExists(atPath: icdURL.path) else {
             NSLog("[MirageLock] scene Vulkan ICD unavailable")
             reportFailure("Scene Vulkan ICD is unavailable")
             return

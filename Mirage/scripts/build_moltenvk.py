@@ -149,20 +149,21 @@ def verify_bundle(app, build=None):
     info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
     required_arches = set(library_uuids(app / "Contents/MacOS" / info["CFBundleExecutable"]))
     expected_uuids = manifest["libraries"]["patched"]["uuids"]
-    paths = [app / "Contents/Frameworks/libMoltenVK.dylib"]
+    shared = app / "Contents/Extensions/MirageWallpaperExtension.appex/Contents"
+    paths = {(shared / "Frameworks/libMoltenVK.dylib").resolve()}
+    if (app / "Contents/Frameworks/libMoltenVK.dylib").resolve() not in paths:
+        raise ValueError("App does not resolve the shared extension runtime")
     for component in ("Contents/Resources/Screen Savers/MirageScreenSaver.saver",
-                      "Contents/Resources/Screen Savers/MirageDynamicLockScreen.saver",
-                      "Contents/Extensions/MirageWallpaperExtension.appex"):
-        if (app / component).is_dir():
-            paths.append(app / component / "Contents/Frameworks/libMoltenVK.dylib")
-    paths = {path.resolve() for path in paths}
+                      "Contents/Resources/Screen Savers/MirageDynamicLockScreen.saver"):
+        for duplicated in ("Contents/Frameworks", "Contents/Resources/assets", "Contents/Resources/vulkan"):
+            if (app / component / duplicated).exists():
+                raise ValueError(f"Scene host duplicates the shared app payload: {component}/{duplicated}")
     diagnostic_root = app / "Contents/Resources/SceneDiagnostics"
     discovered = {path.resolve() for path in app.rglob("libMoltenVK.dylib") if not path.is_relative_to(diagnostic_root)}
     if discovered != paths:
         raise ValueError("Unexpected or missing production MoltenVK library locations")
-    icds = [app / "Contents/Resources/Renderers/vulkan/icd.d/MoltenVK_icd.json"]
-    icds += [path.parent.parent / "Resources/vulkan/icd.d/MoltenVK_icd.json" for path in paths
-             if path != (app / "Contents/Frameworks/libMoltenVK.dylib").resolve()]
+    icds = [app / "Contents/Resources/Renderers/vulkan/icd.d/MoltenVK_icd.json",
+            shared / "Resources/vulkan/icd.d/MoltenVK_icd.json"]
     for icd in icds:
         config = json.loads(icd.read_text())
         library = Path(config["ICD"]["library_path"])
