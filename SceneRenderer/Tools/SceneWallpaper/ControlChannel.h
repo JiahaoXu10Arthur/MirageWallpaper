@@ -70,20 +70,8 @@ public:
     SceneControlChannel(const SceneControlChannel&)            = delete;
     SceneControlChannel& operator=(const SceneControlChannel&) = delete;
 
-    void start() {
-        if (m_running.exchange(true)) return;
-        m_thread = std::thread([this] { readLoop(); });
-    }
-
-    void stop() {
-        m_running.store(false);
-        if (m_thread.joinable()) {
-            // readLoop polls stdin with a short timeout, so shutdown can join
-            // safely instead of leaving a detached thread holding references
-            // to this channel and SceneWallpaper during teardown.
-            m_thread.join();
-        }
-    }
+    void start();
+    void stop();
 
 private:
     void readLoop();
@@ -95,6 +83,7 @@ private:
     std::function<void()> m_on_deactivate;
     std::function<void(const std::string&, const std::string&)> m_on_snapshot;
     std::function<void(const std::string&)> m_on_storage;
+    int                                                         m_wake_fds[2] { -1, -1 };
     std::atomic<bool>     m_running { false };
     std::thread           m_thread;
 };
