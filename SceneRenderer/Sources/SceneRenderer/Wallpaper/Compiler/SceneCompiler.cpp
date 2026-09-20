@@ -4927,6 +4927,7 @@ public:
         if (auto it = m_synth.find(name); it != m_synth.end()) return it->second->header;
         return m_inner ? m_inner->ParseHeader(name) : ImageHeader {};
     }
+    void ReleaseSyntheticImage(std::string_view name) override { m_synth.erase(std::string(name)); }
     void Register(std::string name, std::shared_ptr<Image> img) {
         m_synth[std::move(name)] = std::move(img);
     }
@@ -5673,7 +5674,8 @@ void ParseTextObj(ParseContext& context, wpscene::TextObject& obj) {
                             sp_mesh,
                             geometry_policy,
                             direct_text,
-                            text_padding = style.padding](text::TextLayoutMetrics metrics) {
+                            last_geometry = std::make_shared<std::optional<text::TextGeometry>>(),
+                            text_padding  = style.padding](text::TextLayoutMetrics metrics) {
         auto* compose_ptr = compose_hold.get();
         metrics.padding   = text_padding;
         if (! anchor_state->authored_width)
@@ -5688,6 +5690,8 @@ void ParseTextObj(ParseContext& context, wpscene::TextObject& obj) {
 
         const auto geometry       = text::ResolveTextGeometry(geometry_policy, metrics);
         const bool target_changed = runtime_targets->Apply(geometry);
+        if (! target_changed && *last_geometry == geometry) return;
+        *last_geometry                 = geometry;
         const float                 hx = geometry.draw_width * 0.5f;
         const float                 hy = geometry.draw_height * 0.5f;
         const float                 cx = geometry.draw_offset_x;
@@ -5720,7 +5724,7 @@ void ParseTextObj(ParseContext& context, wpscene::TextObject& obj) {
             if (sp_mesh) sp_mesh->SetLayoutDirty();
         }
     };
-       rebuild_compose(initial_metrics);
+    rebuild_compose(initial_metrics);
 
     auto apply_text_origin = [anchor_state, apply_text_anchor](const script::ScriptValue& value) {
         Vector3f current = anchor_state->origin;
@@ -5894,6 +5898,7 @@ void ParseTextObj(ParseContext& context, wpscene::TextObject& obj) {
     // compose quad to the new text dims. Runs on the render thread, which
     // is also the JS thread — no synchronization needed.
     auto set_text = [layouter, rebuild_compose, current_text](std::string_view s) {
+        if (*current_text == s) return;
         *current_text = std::string(s);
         if (auto* active_face = layouter->Face()) active_face->Populate(text::DecodeUtf8(s));
         layouter->SetText(s);

@@ -717,6 +717,7 @@ struct FieldScript::Impl {
     // Per-script cursor-inside-bbox state used to edge-detect
     // cursorEnter / cursorLeave between frames.
     bool cursor_inside { false };
+    bool has_cursor_exports { false };
     // Buttons whose press landed on this node. While a button is captured the
     // node keeps receiving cursorMove / cursorUp even after the cursor leaves
     // its bbox, so a drag survives fast pointer motion and release-outside —
@@ -4592,7 +4593,7 @@ void JsRuntime::TickAll() {
     };
     for (auto& fs : m_impl->scripts) {
         auto* I = fs->m_impl.get();
-        if (! I->alive || ! I->node) continue;
+        if (! I->alive || ! I->node || ! I->has_cursor_exports) continue;
         const auto current_cursor = ResolveCursorNode(&m_impl->host, I->node, cursor);
         const bool over_node = in_window && ancestors_visible(I->node) && I->node->Solid() &&
                                current_cursor.inside;
@@ -4878,6 +4879,14 @@ FieldScript* JsRuntime::MakeFieldScript(
     I->sha           = sha_str;
     I->kind          = (field_kind_in == FieldKind::Unknown) ? FieldKind::Scalar : field_kind_in;
     I->module_ns     = ns; // owns one ref now
+    // Test export presence, not its initial value: an exported live binding
+    // may acquire a callback later. Modules cannot add new export names.
+    for (const char* name :
+         { "cursorEnter", "cursorLeave", "cursorMove", "cursorDown", "cursorUp", "cursorClick" }) {
+        const JSAtom atom = JS_NewAtom(ctx, name);
+        I->has_cursor_exports |= JS_HasProperty(ctx, ns, atom) > 0;
+        JS_FreeAtom(ctx, atom);
+    }
     I->node          = node;
     I->wrapped_layer = wrapped; // takes ownership; freed in JsRuntime dtor
     I->clone_queue   = std::move(clones);
