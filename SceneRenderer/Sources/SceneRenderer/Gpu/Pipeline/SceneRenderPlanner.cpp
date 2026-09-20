@@ -229,6 +229,8 @@ void GraphLinkFinalizer::apply(ExtraInfo& extra) {
             input.binding.name    = copy_desc.key;
             input.desc            = std::move(copy_desc);
             input.binding.request = BuildGraphTextureRequest(extra, input.binding.name);
+            // Every consumer refers to this same finalized source version.
+            output_it->second = input;
         }
 
         if (! extra.rgraph->readTexture(consumer.pass_id, input.ref)) {

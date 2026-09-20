@@ -481,6 +481,27 @@ struct RenderProgram {
     }
 
     void finalizeResourceRequests(sr::Scene& scene) {
+        // Materialize implicit copy destinations before deriving their usage.
+        for (auto& record : pass_records) {
+            if (auto* copy = dynamic_cast<CopyPass*>(record.pass))
+                record.invalidate(copy->finalizeResourceRequests(scene));
+        }
+        const bool capture = std::getenv("SCENERENDERER_DIAGNOSTICS_DIR") != nullptr;
+        for (auto& [name, rt] : scene.renderTargets) {
+            rt.transfer_source      = capture || name == sr::SpecTex_Default || rt.mipmap_level > 1;
+            rt.transfer_destination = name == sr::SpecTex_Default || rt.mipmap_level > 1;
+        }
+        for (const auto& record : pass_records) {
+            if (auto* copy = dynamic_cast<CopyPass*>(record.pass)) {
+                if (auto it = scene.renderTargets.find(copy->desc().src);
+                    it != scene.renderTargets.end())
+                    it->second.transfer_source = true;
+                if (auto it = scene.renderTargets.find(copy->desc().dst);
+                    it != scene.renderTargets.end())
+                    it->second.transfer_destination = true;
+            }
+        }
+        finalizeFramePassRequests(scene);
         for (auto& record : pass_records) {
             if (record.pass == nullptr) continue;
             auto flags = record.pass->finalizeResourceRequests(scene);
@@ -504,6 +525,29 @@ struct RenderProgram {
 
         for (auto& record : pass_records) {
             record.prepareIfNeeded(scene, device, rr);
+        }
+        std::vector<std::string> imported_keys;
+        for (const auto& record : pass_records) {
+            if (record.pass == nullptr) continue;
+            for (const auto& texture : record.pass->textureRequestDiagnostics()) {
+                if (texture.request && texture.request->kind == TextureRequestKind::Imported)
+                    imported_keys.push_back(
+                        imported_textures.ResolveImportedTextureKey(*texture.request));
+            }
+        }
+        device.tex_cache().RetainImportedTextures(imported_keys);
+        device.mesh_cache().evictUnused();
+        if (auto* fonts = sr::text::SceneFontCache(scene)) {
+            // Include hidden material references, since those can become visible
+            // without constructing a new layouter or registering the atlas again.
+            for (const auto* material : scene.ResourceIndex().Materials())
+                if (material)
+                    imported_keys.insert(
+                        imported_keys.end(), material->textures.begin(), material->textures.end());
+            fonts->TrimUnusedFaces(imported_keys, [&scene](std::string_view key) {
+                if (scene.imageParser) scene.imageParser->ReleaseSyntheticImage(key);
+                scene.textures.erase(std::string(key));
+            });
         }
     }
 
@@ -746,6 +790,7 @@ struct RenderProgram {
 };
 
 void ReleaseCompletedRetiredResources(RenderingResources& rr) {
+    if (rr.pipeline_retire_queue.pending() == 0) return;
     rr.pipeline_retire_queue.ReleaseAllReady();
     rr.pipeline_cache.PruneExpired();
     rr.render_pass_cache.PruneExpired();
@@ -897,6 +942,9 @@ void VulkanRender::deviceUuid(uint8_t out[16]) const {
 
 void VulkanRender::pumpVideoTextures(double dt_seconds) {
     if (! pImpl->m_inited || ! pImpl->m_device) return;
+    // CPU fallback staging belongs to the previous submitted frame as well.
+    // Retire it before the decoder can overwrite that staging allocation.
+    if (! pImpl->retireInFlightFrame()) return;
     pImpl->m_device->tex_cache().PumpVideoTextures(dt_seconds);
 }
 
@@ -1124,7 +1172,7 @@ bool VulkanRender::Impl::init(RenderInitInfo info) {
         rstd_info("msaa requested={} actual={}", requested, (uint32_t)m_msaa_samples);
     }
 
-    if (info.offscreen) {
+    if (info.offscreen && ! m_metal_frame_cb) {
         m_ex_swapchain = CreateLocalExSwapchain(*m_device,
                                                 extent.width,
                                                 extent.height,
@@ -1155,7 +1203,7 @@ bool VulkanRender::Impl::initRes() {
         m_finpass->setPresentFormat(m_device->swapchain().format());
         m_finpass->setPresentCanTransferSrc(
             (m_device->swapchain().usage() & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0);
-    } else {
+    } else if (m_ex_swapchain) {
         // Offscreen: ExSwapchain implementation chooses both. Local offscreen
         // returns (GENERAL,
         // IGNORED). Translate IGNORED to graphics_family so FinPass's
@@ -1288,15 +1336,6 @@ bool VulkanRender::Impl::CreateRenderingResource(RenderingResources& rr) {
 
     if (m_with_surface) {
         if (! createSwapchainSemaphores()) return false;
-    }
-
-    if (! m_with_surface) {
-        VkSemaphoreCreateInfo ci {
-            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-        };
-        VVK_CHECK_BOOL_RE(m_device->handle().CreateSemaphore(ci, rr.sem_export));
     }
 
     rr.dyn_buf                 = m_dyn_buf.get();
@@ -1652,24 +1691,24 @@ bool VulkanRender::Impl::drawFrameSwapchain() {
     return true;
 }
 bool VulkanRender::Impl::drawFrameOffscreen() {
-    if (! m_ex_swapchain || m_failed) return false;
+    if ((! m_ex_swapchain && ! m_metal_frame_cb) || m_failed) return false;
 
     // Poll the offscreen swapchain before committing to a slot.
     // Previous frame's GPU work has fenced at the tail of the last
     // drawFrameOffscreen, so the cmd pool is idle.
-    m_ex_swapchain->poll();
+    if (m_ex_swapchain) m_ex_swapchain->poll();
 
     // Skip until both the swapchain has slots and the scene has loaded
     // (FinPass.prepare runs from compileRenderGraph). FinPass itself is
     // format-agnostic now — vkCmdBlitImage handles cross-format channel
     // mapping, no rebuild needed on renegotiation.
-    if (! m_ex_swapchain->ready() || ! m_finpass->prepared()) {
+    if ((m_ex_swapchain && ! m_ex_swapchain->ready()) || ! m_finpass->prepared()) {
         return false;
     }
 
     RenderingResources& rr = m_rendering_resources;
-    ImageParameters     image;
-    if (! m_ex_swapchain->acquireRenderTarget(image)) {
+    ImageParameters     image {};
+    if (m_ex_swapchain && ! m_ex_swapchain->acquireRenderTarget(image)) {
         return false;
     }
 
@@ -1709,14 +1748,13 @@ bool VulkanRender::Impl::drawFrameOffscreen() {
     std::array<uint64_t, 1> wait_values {
         rr.pending_upload_value,
     };
-    std::array<uint64_t, 1>       signal_values { 0 };
     VkTimelineSemaphoreSubmitInfo timeline_info {
         .sType                     = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
         .pNext                     = nullptr,
         .waitSemaphoreValueCount   = wait_upload ? 1u : 0u,
         .pWaitSemaphoreValues      = wait_upload ? wait_values.data() : nullptr,
-        .signalSemaphoreValueCount = wait_upload ? 1u : 0u,
-        .pSignalSemaphoreValues    = wait_upload ? signal_values.data() : nullptr,
+        .signalSemaphoreValueCount = 0,
+        .pSignalSemaphoreValues    = nullptr,
     };
     VkSubmitInfo sub_info {
         .sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -1726,8 +1764,8 @@ bool VulkanRender::Impl::drawFrameOffscreen() {
         .pWaitDstStageMask    = wait_upload ? wait_stages.data() : nullptr,
         .commandBufferCount   = 1,
         .pCommandBuffers      = rr.command.address(),
-        .signalSemaphoreCount = 1,
-        .pSignalSemaphores    = rr.sem_export.address(),
+        .signalSemaphoreCount = 0,
+        .pSignalSemaphores    = nullptr,
     };
     VkResult res = m_device->graphics_queue().handle.Submit(sub_info, *rr.fence_frame);
     if (res != VK_SUCCESS) {
@@ -1752,7 +1790,7 @@ bool VulkanRender::Impl::drawFrameOffscreen() {
         return false;
     }
 
-    m_ex_swapchain->submitRendered(-1);
+    if (m_ex_swapchain) m_ex_swapchain->submitRendered(-1);
     return true;
 }
 
@@ -1908,7 +1946,6 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
     };
     m_program.finalizeRenderTargetSizes(
         scene, m_device->out_extent(), max_framebuffer_extent, m_msaa_samples);
-    m_program.finalizeFramePassRequests(scene);
     m_program.finalizeResourceRequests(scene);
     m_device->tex_cache().BeginVideoTextureActivity();
     m_program.prepare(scene, *m_device, m_rendering_resources, render_scene);
@@ -1935,7 +1972,6 @@ void VulkanRender::Impl::refreshPreparedResources(Scene&                     sce
     };
     m_program.finalizeRenderTargetSizes(
         scene, m_device->out_extent(), max_framebuffer_extent, m_msaa_samples);
-    m_program.finalizeFramePassRequests(scene);
     m_program.finalizeResourceRequests(scene);
     m_program.prepare(scene, *m_device, m_rendering_resources, render_scene);
     m_program.rebuildScopes();

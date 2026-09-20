@@ -465,6 +465,12 @@ void FinPass::prepare(Scene& scene, const Device& device, RenderingResources& /*
 }
 
 void FinPass::execute(const Device& device, RenderingResources& rr) {
+    // Metal consumers read the render target directly after GPU completion.
+    // Only snapshots require its temporary transfer-source layout.
+    const char* dump_path = FrameDumpPath();
+    if (m_desc.vk_present.handle == VK_NULL_HANDLE && ! LiveFrameRequested() &&
+        (m_dump_done || dump_path == nullptr || dump_path[0] == '\0'))
+        return;
     auto&    cmd = rr.command;
     uint32_t gqf = device.graphics_queue().family_index;
 
@@ -498,7 +504,7 @@ void FinPass::execute(const Device& device, RenderingResources& rr) {
                             b);
     }
 
-    {
+    if (m_desc.vk_present.handle != VK_NULL_HANDLE) {
         VkImageMemoryBarrier b {
             .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext               = nullptr,
@@ -522,7 +528,7 @@ void FinPass::execute(const Device& device, RenderingResources& rr) {
                             b);
     }
 
-    {
+    if (m_desc.vk_present.handle != VK_NULL_HANDLE) {
         const bool can_copy = m_desc.vk_result.extent.width == m_desc.vk_present.extent.width &&
                               m_desc.vk_result.extent.height == m_desc.vk_present.extent.height &&
                               m_desc.result_format == VK_FORMAT_R8G8B8A8_UNORM &&
@@ -597,6 +603,10 @@ void FinPass::execute(const Device& device, RenderingResources& rr) {
                             VK_DEPENDENCY_BY_REGION_BIT,
                             b);
     }
+
+    // Direct Metal consumers sample vk_result, so no export-slot copy or
+    // transition is needed. CPU snapshots above still use the scene result.
+    if (m_desc.vk_present.handle == VK_NULL_HANDLE) return;
 
     const bool dump_present = PresentDumpRequested();
     if (dump_present && m_desc.present_can_transfer_src) {

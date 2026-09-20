@@ -360,9 +360,11 @@ bool Device::recreateSwapchain(VkSurfaceKHR surface) {
 }
 
 VkDeviceSize Device::GetUsage() const {
-    VmaBudget budget;
-    vmaGetHeapBudgets(*m_allocator, &budget);
-    return budget.usage;
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets {};
+    vmaGetHeapBudgets(*m_allocator, budgets.data());
+    VkDeviceSize usage = 0;
+    for (const auto& budget : budgets) usage += budget.usage;
+    return usage;
 }
 
 void Device::Destroy(bool wait_idle) {
