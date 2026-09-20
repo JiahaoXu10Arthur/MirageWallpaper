@@ -511,12 +511,9 @@ int main(int argc, char** argv) {
     if (! ParseArgs(argc, argv, options)) return 1;
 
     setenv("MVK_CONFIG_PRESENT_WITH_COMMAND_BUFFER", "1", /*overwrite=*/0);
-    // MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS is deliberately NOT set: it makes
-    // every vkQueueSubmit block the calling thread until the Metal command
-    // buffer completes, which stalls the host on top of the frame's own fence
-    // wait and defeats any CPU/GPU overlap. The renderer's synchronisation is
-    // explicit (fences + semaphores), so the asynchronous default is correct.
-    // Still overrideable from the shell for debugging.
+    // Keep MoltenVK's submission-thread policy at the driver default. In 1.4.2,
+    // SYNCHRONOUS_QUEUE_SUBMITS defaults to 1 and encodes on the caller thread;
+    // it does not wait for GPU completion. Fences govern resource reuse below.
 
     auto     wallpaper = std::make_unique<sr::SceneWallpaper>();
     AppState state;
@@ -534,11 +531,16 @@ int main(int argc, char** argv) {
         .mouse_button = MouseButtonCallback,
         .mouse_enter  = MouseEnterCallback,
         .closed       = nullptr,
+        .redraw_requested =
+            [](void* userdata) {
+                auto* state = static_cast<AppState*>(userdata);
+                if (state->wallpaper) state->wallpaper->requestFrame();
+            },
         .first_frame_presented = FirstFramePresentedCallback,
-        .activated    = ActivatedCallback,
-        .activation_failed = ActivationFailedCallback,
-        .deactivated  = DeactivatedCallback,
-        .userdata     = &state,
+        .activated             = ActivatedCallback,
+        .activation_failed     = ActivationFailedCallback,
+        .deactivated           = DeactivatedCallback,
+        .userdata              = &state,
     };
     state.desktop = SceneRendererMacDesktopCreate(&desktop_config, callbacks);
     if (state.desktop == nullptr) {
@@ -636,6 +638,10 @@ int main(int argc, char** argv) {
     info.width              = ClampRenderExtent(render_width, 1920);
     info.height             = ClampRenderExtent(render_height, 1080);
     info.msaa_samples       = options.msaa;
+    info.allow_on_demand         = true;
+    info.frame_activity_callback = [&state](bool running) {
+        SceneRendererMacDesktopSetPaused(state.desktop, ! running);
+    };
     info.redraw_callback    = [&state]() {
         SceneRendererMacDesktopWake(state.desktop);
     };
@@ -736,11 +742,19 @@ int main(int argc, char** argv) {
         void* desktop = state.desktop;
         control.emplace(
             *wallpaper,
-            [desktop]() { SceneRendererMacDesktopStop(desktop); },
-            [desktop]() { SceneRendererMacDesktopActivate(desktop); },
-            [desktop]() { SceneRendererMacDesktopDeactivate(desktop); },
-            [](const std::string& path, const std::string& token) {
-                const bool ok = ! path.empty() && mirage::WriteSceneSnapshot(path);
+            [desktop]() {
+                SceneRendererMacDesktopStop(desktop);
+            },
+            [desktop]() {
+                SceneRendererMacDesktopActivate(desktop);
+            },
+            [desktop]() {
+                SceneRendererMacDesktopDeactivate(desktop);
+            },
+            [renderer = wallpaper.get()](const std::string& path, const std::string& token) {
+                const bool ok = ! path.empty() && mirage::WriteSceneSnapshot(path, 4.0, [renderer] {
+                    renderer->requestFrame();
+                });
                 EmitSnapshotDone(token, ok);
             },
             [renderer = wallpaper.get()](const std::string& token) {

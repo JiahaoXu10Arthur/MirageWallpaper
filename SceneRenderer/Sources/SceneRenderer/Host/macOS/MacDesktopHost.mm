@@ -55,6 +55,7 @@ struct MacDesktopHost {
     NSWindow*                        window { nil };
     CGDirectDisplayID                display_id { 0 };
     NSTimer*                         input_timer { nil };
+    id                               geometry_observer { nil };
     SRHostRef*                       hostRef { nil };  // ObjC wrapper for safe weak reference
     CAMetalLayer*                    surface_layer { nil };
     NSUInteger                       last_buttons { 0 };
@@ -756,7 +757,18 @@ extern "C" void* SceneRendererMacDesktopCreate(const SceneRendererMacDesktopConf
                                                        MacDesktopHost* h = static_cast<MacDesktopHost*>(ref.hostPtr);
                                                        if (h != nullptr) PollInput(h);
                                                      }];
+        host->input_timer.tolerance = interval * 0.1;
         [NSRunLoop.mainRunLoop addTimer:host->input_timer forMode:NSRunLoopCommonModes];
+        host->geometry_observer = [[NSNotificationCenter.defaultCenter
+            addObserverForName:NSApplicationDidChangeScreenParametersNotification
+                        object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification*) {
+                auto* current = static_cast<MacDesktopHost*>(ref.hostPtr);
+                if (current != nullptr) {
+                    NormalizeGeometry(current);
+                    if (current->callbacks.redraw_requested)
+                        current->callbacks.redraw_requested(current->callbacks.userdata);
+                }
+            }] retain];
         PollInput(host);
         return host;
     }
@@ -778,6 +790,11 @@ extern "C" void SceneRendererMacDesktopDestroy(void* handle) {
     }
 
     auto cleanup = ^{
+      if (host->geometry_observer != nil) {
+          [NSNotificationCenter.defaultCenter removeObserver:host->geometry_observer];
+          [host->geometry_observer release];
+          host->geometry_observer = nil;
+      }
       if (host->input_timer != nil) {
           [host->input_timer invalidate];
           host->input_timer = nil;
@@ -809,6 +826,17 @@ extern "C" int SceneRendererMacDesktopRun(void* handle) {
 }
 
 extern "C" void SceneRendererMacDesktopStop(void*) { StopApplicationOnMainThread(); }
+
+extern "C" void SceneRendererMacDesktopSetPaused(void* handle, bool paused) {
+    auto* host = static_cast<MacDesktopHost*>(handle);
+    if (host == nullptr || host->hostRef == nil) return;
+    SRHostRef* ref = host->hostRef;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        auto* current = static_cast<MacDesktopHost*>(ref.hostPtr);
+        if (current == nullptr || current->input_timer == nil) return;
+        current->input_timer.fireDate = paused ? NSDate.distantFuture : NSDate.date;
+    });
+}
 
 extern "C" void SceneRendererMacDesktopWake(void* handle) {
     auto* host = static_cast<MacDesktopHost*>(handle);
@@ -846,6 +874,8 @@ extern "C" void SceneRendererMacDesktopActivate(void* handle) {
       host->window.alphaValue = 0.0;
       [host->window orderFrontRegardless];
       [CATransaction flush];
+      if (host->callbacks.redraw_requested)
+          host->callbacks.redraw_requested(host->callbacks.userdata);
     };
     if (NSThread.isMainThread) {
         activate();

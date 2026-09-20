@@ -73,6 +73,8 @@ struct SceneWallpaperConfig {
     bool                                    load_from_memory { false };
 };
 
+bool SceneCanRenderOnDemand(const Scene&);
+
 class SceneRuntimeController;
 
 class SceneWallpaper : NoCopy {
