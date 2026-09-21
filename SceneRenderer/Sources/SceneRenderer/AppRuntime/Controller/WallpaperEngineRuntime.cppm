@@ -57,6 +57,8 @@ struct SceneWallpaperConfig {
     std::string                             assets_dir;
     std::string                             cache_dir;
     std::string                             script_storage_dir;
+    std::optional<std::string>               script_storage_snapshot;
+    std::function<void(std::string)>         script_storage_callback;
     std::shared_ptr<wpscene::SceneDocument> scene_document;
     rstd::json::Map                         user_properties;
     uint32_t                                fps { 30 };
@@ -70,6 +72,8 @@ struct SceneWallpaperConfig {
     bool                                    external_spectrum { false };
     bool                                    load_from_memory { false };
 };
+
+bool SceneCanRenderOnDemand(const Scene&);
 
 class SceneRuntimeController;
 
@@ -110,6 +114,7 @@ public:
     void setOnUserPropertyDiagnostics(UserPropertyDiagnosticCallback);
     void requestPreparedPassDiagnostics(RenderPassDiagnosticCallback);
     void resetScriptStorage();
+    void exportScriptStorage(std::function<void(std::string)> callback);
 
     // Install (or clear, with `nullptr`) a callback invoked on the
     // main thread after each scene is parsed, carrying the scene's

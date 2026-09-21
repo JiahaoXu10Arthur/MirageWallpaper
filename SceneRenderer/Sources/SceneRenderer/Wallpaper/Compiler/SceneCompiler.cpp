@@ -546,7 +546,9 @@ std::vector<sr::SceneNode*> SpawnLayerClones(ParseContext& context, SceneNode* t
 script::ScriptScene& EnsureScriptScene(ParseContext& context) {
     if (! context.script_scene) {
         context.script_scene = std::make_unique<script::ScriptScene>();
-        if (! context.script_persistence_path.empty())
+        if (context.script_storage_snapshot)
+            context.script_scene->runtime().SetStorageSnapshot(*context.script_storage_snapshot);
+        else if (! context.script_persistence_path.empty())
             context.script_scene->runtime().SetPersistence(context.script_persistence_path);
         context.script_scene->runtime().SetCanvasSize(static_cast<float>(context.ortho_w),
                                                       static_cast<float>(context.ortho_h));
@@ -4925,6 +4927,7 @@ public:
         if (auto it = m_synth.find(name); it != m_synth.end()) return it->second->header;
         return m_inner ? m_inner->ParseHeader(name) : ImageHeader {};
     }
+    void ReleaseSyntheticImage(std::string_view name) override { m_synth.erase(std::string(name)); }
     void Register(std::string name, std::shared_ptr<Image> img) {
         m_synth[std::move(name)] = std::move(img);
     }
@@ -5671,7 +5674,8 @@ void ParseTextObj(ParseContext& context, wpscene::TextObject& obj) {
                             sp_mesh,
                             geometry_policy,
                             direct_text,
-                            text_padding = style.padding](text::TextLayoutMetrics metrics) {
+                            last_geometry = std::make_shared<std::optional<text::TextGeometry>>(),
+                            text_padding  = style.padding](text::TextLayoutMetrics metrics) {
         auto* compose_ptr = compose_hold.get();
         metrics.padding   = text_padding;
         if (! anchor_state->authored_width)
@@ -5686,6 +5690,8 @@ void ParseTextObj(ParseContext& context, wpscene::TextObject& obj) {
 
         const auto geometry       = text::ResolveTextGeometry(geometry_policy, metrics);
         const bool target_changed = runtime_targets->Apply(geometry);
+        if (! target_changed && *last_geometry == geometry) return;
+        *last_geometry                 = geometry;
         const float                 hx = geometry.draw_width * 0.5f;
         const float                 hy = geometry.draw_height * 0.5f;
         const float                 cx = geometry.draw_offset_x;
@@ -5718,7 +5724,7 @@ void ParseTextObj(ParseContext& context, wpscene::TextObject& obj) {
             if (sp_mesh) sp_mesh->SetLayoutDirty();
         }
     };
-       rebuild_compose(initial_metrics);
+    rebuild_compose(initial_metrics);
 
     auto apply_text_origin = [anchor_state, apply_text_anchor](const script::ScriptValue& value) {
         Vector3f current = anchor_state->origin;
@@ -5892,6 +5898,7 @@ void ParseTextObj(ParseContext& context, wpscene::TextObject& obj) {
     // compose quad to the new text dims. Runs on the render thread, which
     // is also the JS thread — no synchronization needed.
     auto set_text = [layouter, rebuild_compose, current_text](std::string_view s) {
+        if (*current_text == s) return;
         *current_text = std::string(s);
         if (auto* active_face = layouter->Face()) active_face->Populate(text::DecodeUtf8(s));
         layouter->SetText(s);
@@ -6218,13 +6225,15 @@ std::array<i32, 2> ResolveOrthoProjectionExtent(const wpscene::SceneMetadata&   
 ParseContext BuildContext(fs::VFS& vfs, std::string_view scene_id, const wpscene::SceneMetadata& sc,
                           std::array<i32, 2>                       ortho_extent,
                           rstd::Option<rstd::ref<rstd::json::Map>> user_properties,
-                          std::string script_persistence_path) {
+                          std::string script_persistence_path,
+                          std::optional<std::string> script_storage_snapshot) {
     ParseContext context;
     InitContext(context, vfs, sc, ortho_extent);
     ParseCamera(context, sc);
     context.user_properties = user_properties;
     context.pkg_version     = sc.pkg_version;
     context.script_persistence_path = std::move(script_persistence_path);
+    context.script_storage_snapshot = std::move(script_storage_snapshot);
 
     context.scene->renderTargets[SpecTex_Default.data()] = {
         .width             = context.ortho_w,
@@ -7126,7 +7135,8 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view              scene_
                                             sc,
                                             ortho_extent,
                                             m_user_properties,
-                                            m_script_persistence_path);
+                                            m_script_persistence_path,
+                                            m_script_storage_snapshot);
     context.scene_has_scripts       = SceneHasScripts(json, scene_objs);
     context.scene_accesses_effects  = SceneAccessesEffects(json, scene_objs);
     context.scene_layer_text_writes = SceneWritesLayerText(json, scene_objs);

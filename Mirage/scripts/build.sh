@@ -86,12 +86,17 @@ BUILD_LOG="$BUILD_DIR/xcodebuild-$CONFIG.log"
 : > "$BUILD_LOG"
 chmod 600 "$BUILD_LOG"
 
+RELEASE_FLAGS=()
+if [ "$CONFIG" = Release ]; then
+    RELEASE_FLAGS=(ENABLE_CODE_COVERAGE=NO CLANG_COVERAGE_MAPPING=NO DEPLOYMENT_POSTPROCESSING=YES)
+fi
 echo "[build] 编译 ($CONFIG)..."
 if ! xcodebuild "${XCCONFIG_ARGS[@]}" -project "$PROJECT" -scheme "$SCHEME" -configuration "$CONFIG" \
     -destination 'platform=macOS' \
     -derivedDataPath "$BUILD_DIR/DD" \
     ARCHS="$TARGET_ARCH" ONLY_ACTIVE_ARCH=YES \
     CODE_SIGN_IDENTITY="$SIGN_IDENTITY" CODE_SIGNING_REQUIRED="$CODE_SIGNING_REQUIRED" CODE_SIGNING_ALLOWED=YES \
+    "${RELEASE_FLAGS[@]}" \
     build > "$BUILD_LOG" 2>&1; then
     echo "[build] 编译失败，错误摘要:" >&2
     { grep -nE "error:|error extracting|not signed at all|In subcomponent:|failed with a nonzero|The following build commands failed" \
@@ -112,6 +117,7 @@ echo "[build] 内嵌渲染器与依赖..."
 bash "$HERE/bundle_renderers.sh" "$OUT/Mirage.app" "$ROOT" "$SIGN_IDENTITY"
 
 codesign --verify --deep --strict --verbose=2 "$OUT/Mirage.app"
+bash "$HERE/report_bundle_size.sh" "$OUT/Mirage.app"
 
 if [ "$SIGN_IDENTITY" != "-" ] && [ -n "$NOTARY_PROFILE" ]; then
     NOTARY_TEMP_DIR="$(mktemp -d -t mirage-notary)"

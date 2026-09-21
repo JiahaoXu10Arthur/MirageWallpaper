@@ -357,7 +357,8 @@ void ParticleSubSystem::SimulateInstance(
     if (m_spawn_type == SpawnType::STATIC_CONTROLPOINT &&
         m_parent_controlpoint_start_index.has_value() && bounded_data.parent != nullptr &&
         bounded_data.parent_subsystem != nullptr) {
-        std::vector<usize> ordered;
+        static thread_local std::vector<usize> ordered;
+        ordered.clear();
         const auto parent_particles = bounded_data.parent->Particles();
         ordered.reserve(parent_particles.size());
         for (usize index = 0; index < parent_particles.size(); ++index)

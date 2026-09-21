@@ -49,6 +49,9 @@ struct RenderInitInfo {
     ReDrawCB redraw_callback;
     MetalFrameCB metal_frame_callback;
     RenderFailureCB failure_callback;
+    // Hosts enabling this must request frames after activation, resize and capture.
+    bool                              allow_on_demand { false };
+    std::function<void(bool running)> frame_activity_callback;
 };
 
 std::unique_ptr<rg::RenderGraph> sceneToRenderGraph(Scene&);

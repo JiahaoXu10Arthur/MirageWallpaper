@@ -21,6 +21,10 @@
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-GPL--3.0-blue"></a>
 </p>
 
+<p align="center">
+  <a href="#开发团队">开发团队</a>
+</p>
+
 > [!IMPORTANT]
 > **Mirage 当前仍处于早期阶段。** 如果遇到问题，请认真撰写 [GitHub Issue](https://github.com/laobamac/MirageWallpaper/issues/new/choose)，说明系统与 App 版本、复现步骤、预期结果、实际现象和相关日志；也可以加入 **QQ 交流群 2160040437** 反馈。
 
@@ -55,9 +59,11 @@ Mirage 会继续免费开放开发。如果它为你的桌面带来了价值，�
 - 创意工坊下载器直接调用 SteamKit2 的清单与 CDN API，实现参考 [DepotDownloader](https://github.com/SteamRE/DepotDownloader) 的成熟下载流程，但不捆绑或启动 DepotDownloader 可执行程序。
 - 复用一个长驻 Steam 会话，避免每次下载前重复启动和登录。
 - 最多同时下载三个创意工坊作品，实时显示 CDN 接收字节、下载速度、进度和预计剩余时间；每个任务可独立取消。
-- 已下载作品可直接播放，并打开音量、速度、填充模式及作品自定义属性侧栏。
-- 支持多显示器覆盖、菜单栏控制、登录启动和桌面占位图恢复。
-- 可安装 Mirage 自带的动态屏保，直接播放视频、网页和场景壁纸，并保留当前预设与自定义属性。
+- 已下载作品可直接播放，并打开音量、速度、填充模式、画面位置及作品自定义属性侧栏。
+- 支持按显示器保存播放列表，可按计时器、登录、当日时间、星期或视频结束自动切换，并提供有序/随机顺序和过渡效果。
+- 支持多显示器覆盖、菜单栏控制、登录启动、已订阅作品页和桌面占位图恢复。
+- 可安装 Mirage 自带的动态屏保，独立播放视频和场景壁纸，并保留当前预设与自定义属性。
+- 设置中提供两套实验性动态锁屏方案：方案 A 需要 macOS 26+，方案 B 需要 macOS 14.2+；两者都只支持视频和场景壁纸。
 - 可在全屏应用、其他应用播放音频、屏幕休眠或电池供电时选择继续、静音、暂停或停止。
 - 使用 macOS“点按墙纸以显示桌面”时会自动恢复播放。
 - 网页壁纸首次运行前显示安全确认，并支持 Wallpaper Engine 用户属性与鼠标事件。
@@ -144,8 +150,10 @@ Mirage 会解析作品声明的入口文件，并对部分非标准目录布局�
 ```bash
 xcode-select --install
 brew install cmake ninja pkg-config llvm molten-vk vulkan-loader vulkan-headers \
-  glslang glfw freetype fontconfig lz4 ffmpeg
+  glslang glfw freetype fontconfig lz4 ffmpeg dav1d nasm
 ```
+
+渲染器构建脚本会自动构建固定版本的仅解码 FFmpeg；Homebrew FFmpeg 只用于生成测试媒体，不会打入应用。dav1d 用于 AV1 解码，nasm 用于 Intel 汇编优化。
 
 ## 从源码构建
 
@@ -271,6 +279,15 @@ VideoRenderer/build/release/Tools/VideoViewer/VideoViewer <video-wallpaper-direc
 2. `./scripts/build_all.sh` 能生成完整 App Bundle；
 3. App Bundle 中包含三个渲染器、运行时动态库、MoltenVK ICD 和 `assets`；
 4. 没有提交 API Key、Steam 登录数据、构建目录或用户壁纸。
+
+## 开发团队
+
+| 姓名 | 身份 | GitHub |
+| --- | --- | --- |
+| Xiaoci Wang | 项目作者 · 开发者 | [@laobamac](https://github.com/laobamac) |
+| Jiale Yu | 开发者 | [@dawalishi821](https://github.com/dawalishi821) |
+| Pikachu Ren | 开发者 | [@PIKACHUIM](https://github.com/PIKACHUIM) |
+| Yinan Qin | 开发者 | [@elysia-best](https://github.com/elysia-best) |
 
 ## 鸣谢
 
