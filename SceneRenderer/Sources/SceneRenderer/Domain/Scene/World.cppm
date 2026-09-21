@@ -206,6 +206,9 @@ struct SceneRenderTarget {
     bool preserve_on_write { false };
     bool hdr_format { false };
     bool inherit_scene_format { true };
+    // Derived by the renderer from graph accesses; conservative before planning.
+    bool transfer_source { true };
+    bool transfer_destination { true };
 
     i32 PhysicalWidth() const { return physical_width > 0 ? physical_width : width; }
     i32 PhysicalHeight() const { return physical_height > 0 ? physical_height : height; }
@@ -2478,6 +2481,7 @@ public:
                                 SceneRenderViewKind  = SceneRenderViewKind::Primary,
                                 SceneRenderAlphaMode = SceneRenderAlphaMode::Composite) = 0;
     virtual void FrameEnd()                                                        = 0;
+    virtual bool RequiresContinuousFrames() const { return true; }
 
     virtual void MouseInput(double x, double y)                     = 0;
     virtual void SetTexelSize(float x, float y)                     = 0;
@@ -2505,6 +2509,7 @@ public:
     virtual bool                   Contains(const std::string&) const = 0;
     virtual std::shared_ptr<Image> Parse(const std::string&)       = 0;
     virtual ImageHeader            ParseHeader(const std::string&) = 0;
+    virtual void                   ReleaseSyntheticImage(std::string_view) {}
 };
 
 struct SceneMaterialId {
@@ -2999,6 +3004,7 @@ public:
     void SetViewportScale(float scale) {
         viewport_scale = std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
     }
+    bool HasViewportScaleAnimation() const { return ! m_viewport_scale_curve.Empty(); }
     void SetViewportScaleAnimation(SceneAnimationCurve curve) {
         m_viewport_scale_curve = std::move(curve);
     }

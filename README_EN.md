@@ -26,6 +26,10 @@
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-GPL--3.0-blue"></a>
 </p>
 
+<p align="center">
+  <a href="#development-team">Development Team</a>
+</p>
+
 > [!IMPORTANT]
 > **Mirage is still in an early stage.** If you encounter a problem, please file a detailed [GitHub Issue](https://github.com/laobamac/MirageWallpaper/issues/new/choose) with your macOS/App version, reproduction steps, expected and actual results, and relevant logs. You can also join the QQ feedback group: **2160040437**.
 
@@ -60,9 +64,11 @@ Please independently verify the network, address, and amount before transferring
 - Calls SteamKit2 manifest and CDN APIs directly for Workshop downloads. The implementation follows proven design patterns from [DepotDownloader](https://github.com/SteamRE/DepotDownloader) without bundling or launching its executable.
 - Reuses one persistent Steam session instead of starting and signing in again for every download.
 - Downloads up to three Workshop items concurrently with live CDN byte counts, speed, progress, and estimated time remaining. Each task can be canceled independently.
-- Plays downloaded works directly and exposes volume, playback rate, fill mode, and wallpaper-provided properties.
-- Supports multi-display coverage, menu-bar controls, login launch, and restoring a desktop placeholder image.
-- Installs Mirage's standalone dynamic screen saver, which can play video, web, and scene wallpapers while retaining the selected preset and custom properties.
+- Plays downloaded works directly and exposes volume, playback rate, fill mode, position, and wallpaper-provided properties.
+- Per-display playlists can rotate wallpapers by timer, logon, time of day, day of week, or video end, with sorted/random order and transitions.
+- Supports multi-display coverage, menu-bar controls, login launch, the subscribed-items tab, and restoring a desktop placeholder image.
+- Installs Mirage's standalone dynamic screen saver, which independently plays video and scene wallpapers while retaining the selected preset and custom properties.
+- Offers two experimental dynamic lock-screen schemes: Scheme A requires macOS 26+, Scheme B requires macOS 14.2+; both support video and scene wallpapers only.
 - Lets you continue, mute, pause, or stop playback when another app is fullscreen, another app plays audio, the display sleeps, or the Mac is on battery.
 - Restores playback after macOS "click wallpaper to reveal desktop" interaction.
 - Shows a security confirmation before first running a web wallpaper and supports Wallpaper Engine user properties and mouse events.
@@ -149,8 +155,10 @@ Install dependencies:
 ```bash
 xcode-select --install
 brew install cmake ninja pkg-config llvm molten-vk vulkan-loader vulkan-headers \
-  glslang glfw freetype fontconfig lz4 ffmpeg
+  glslang glfw freetype fontconfig lz4 ffmpeg dav1d nasm
 ```
+
+Renderer scripts automatically build a pinned decoder-only FFmpeg. Homebrew FFmpeg is used only to generate test media and is not bundled. dav1d supplies AV1 decoding; nasm supplies Intel assembly support.
 
 ## Build from Source
 
@@ -276,6 +284,15 @@ Before submitting a change, verify at least that:
 2. `./scripts/build_all.sh` produces a complete App bundle.
 3. The App bundle contains all three renderers, runtime libraries, the MoltenVK ICD, and `assets`.
 4. No API keys, Steam sign-in data, build directories, or user wallpapers are committed.
+
+## Development Team
+
+| Name | Role | GitHub |
+| --- | --- | --- |
+| Xiaoci Wang | Project Author · Developer | [@laobamac](https://github.com/laobamac) |
+| Jiale Yu | Developer | [@dawalishi821](https://github.com/dawalishi821) |
+| Pikachu Ren | Developer | [@PIKACHUIM](https://github.com/PIKACHUIM) |
+| Yinan Qin | Developer | [@elysia-best](https://github.com/elysia-best) |
 
 ## Acknowledgements
 

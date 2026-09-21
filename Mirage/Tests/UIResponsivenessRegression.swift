@@ -139,6 +139,14 @@ private struct UIResponsivenessRegression {
                 print("StoppedDisplaysRegression: all checks passed")
                 return
             }
+            if CommandLine.arguments.contains("--wallpaper-runtime") {
+                ImageProtocol.imageData = try pngData(color: .green)
+                try await testConfiguration()
+                try await testLockScreenDeployment()
+                try testWallpaperRuntimeSnapshots()
+                print("WallpaperRuntimeRegression: all checks passed")
+                return
+            }
             if CommandLine.arguments.contains("--playback-policy") {
                 try testPlaybackPolicyEvaluation()
                 try testPlaybackPolicyInputs()
@@ -168,6 +176,7 @@ private struct UIResponsivenessRegression {
             try testObservation()
             try await testImages()
             try await testConfiguration()
+            try testWallpaperRuntimeSnapshots()
             try await testLockScreenDeployment()
             try await testRenderers()
             try await testLogs()
@@ -339,6 +348,55 @@ private struct UIResponsivenessRegression {
         try require(stableReload.displayStates.isEmpty && stableReload.manuallyStoppedDisplays == [stableKey],
                     "A stable UUID stop was not restored by the view model")
         print("PASS: stable UUID persistence and reordered temporary stops preserve display identity")
+    }
+
+    static func testScriptStorageTopology(_ wallpaper: WEWallpaper) throws {
+        let uuid = "uuid:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        for rawKeys in [["idx:100", "idx:101"], [uuid, uuid + "#1"]] {
+            let keys = rawKeys.map(DisplayKey.init(rawValue:))
+            func info(_ key: DisplayKey, _ id: CGDirectDisplayID, _ index: Int) -> DisplayInfo {
+                DisplayInfo(key: key, displayID: id, index: index, name: "Script storage topology",
+                            size: CGSize(width: 1920, height: 1080), isMain: index == 0)
+            }
+            let initial = [info(keys[0], 9801, 0), info(keys[1], 9802, 1)]
+            let states = Dictionary(uniqueKeysWithValues: keys.map {
+                ($0, DisplayWallpaperState(wallpaper: wallpaper, runtime: .init()))
+            })
+            let model = WallpaperViewModel(initialStates: states, connectedDisplays: initial)
+            defer { model.renderer.stopAllAndWait() }
+            model.selectedDisplayKey = keys[0]
+            model.resetProperties()
+            let before = model.renderSnapshots(for: wallpaper.id)
+            try require(before[keys[0].rawValue]?.scriptStorage == [:] &&
+                        before[keys[1].rawValue]?.scriptStorage == nil,
+                        "Script storage fixture did not distinguish explicit reset from default storage")
+            var inconsistentNotification = false
+            let observer = model.displayStatesChanges.dropFirst().sink { states in
+                guard states.count == 2 else { return }
+                let snapshot = model.renderSnapshots(for: wallpaper.id)
+                if snapshot[keys[1].rawValue]?.scriptStorage != [:] ||
+                    snapshot[keys[0].rawValue]?.scriptStorage != nil {
+                    inconsistentNotification = true
+                }
+            }
+            defer { observer.cancel() }
+            model.reconcileDisplays([info(keys[0], 9802, 0), info(keys[1], 9801, 1)])
+            try require(!inconsistentNotification, "State observer saw a migrated display before its script storage")
+            let swapped = model.renderSnapshots(for: wallpaper.id)
+            try require(swapped.count == 2 && swapped[keys[1].rawValue]?.scriptStorage == [:] &&
+                        swapped[keys[0].rawValue]?.scriptStorage == nil,
+                        "Display key swap mismatched script storage with its wallpaper state")
+
+            let collapsed = WallpaperViewModel(initialStates: states, connectedDisplays: initial)
+            defer { collapsed.renderer.stopAllAndWait() }
+            collapsed.selectedDisplayKey = keys[0]
+            collapsed.resetProperties()
+            collapsed.reconcileDisplays([info(keys[0], 9802, 0)])
+            let remaining = collapsed.renderSnapshots(for: wallpaper.id)
+            try require(remaining[keys[0].rawValue] != nil && remaining[keys[0].rawValue]?.scriptStorage == nil,
+                        "Disconnected destination's script storage leaked to the remaining display")
+        }
+        print("PASS: script storage snapshots follow display identity across swaps and disconnects")
     }
 
     static func testStoppedReconnectIdentities(_ first: WEWallpaper, _ second: WEWallpaper) async throws {
@@ -540,6 +598,7 @@ private struct UIResponsivenessRegression {
         try testAmbiguousStoppedAssignments(first, second)
         try await testDisplayIDReuse(display, first, second)
         try await testManualStopTopology(first, second)
+        try testScriptStorageTopology(first)
         try await testStoppedReconnectIdentities(first, second)
         try await testStopRekeyCancellation(display, first)
         let failure = try wallpaper("fail-activate-stopped")
@@ -1514,6 +1573,124 @@ private struct UIResponsivenessRegression {
         try require(saved?["a"]?["x"] == 0.1 && saved?["b"]?["x"] == 0.9,
                     "Per-display positions were not preserved")
         print("PASS: screen saver snapshots, stale save rejection and independent display positions")
+    }
+
+    static func testWallpaperRuntimeSnapshots() throws {
+        let fm = FileManager.default
+        let directory = root.appending(path: "runtime-scene")
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        let asset = root.appending(path: "runtime-texture.png")
+        let image = try pngData(color: .green)
+        try image.write(to: asset)
+        let properties: [String: WEProjectProperty] = [
+            "enabled": .init(type: "bool", value: .bool(false)),
+            "amount": .init(type: "slider", value: .number(0.375)),
+            "number": .init(type: "combo", value: .number(1)),
+            "zero": .init(type: "combo", value: .number(0)),
+            "flag": .init(type: "combo", value: .bool(true)),
+            "word": .init(type: "combo", value: .string("1")),
+            "text": .init(type: "textinput", value: .string("文字 🌙\nsecond line")),
+            "color": .init(type: "color", value: .string("0.2 0.4 0.8")),
+            "texture": .init(type: "scenetexture", value: .string(asset.path))
+        ]
+        let descriptors = try JSONSerialization.jsonObject(with: JSONEncoder().encode(properties))
+        try JSONSerialization.data(withJSONObject: ["title": "Runtime", "type": "scene", "file": "scene.json",
+            "general": ["properties": descriptors]]).write(to: directory.appending(path: "project.json"))
+        try Data("{}".utf8).write(to: directory.appending(path: "scene.json"))
+        let wallpaper = WEWallpaper.load(from: directory)
+        var runtime = WallpaperRuntimeState()
+        runtime.speed = 1.75
+        runtime.fillMode = .contain
+        runtime.position = WallpaperPosition(x: 0.1, y: 0.2)
+        let a = WallpaperRenderSnapshot(runtime: runtime, properties: properties,
+                                        scriptStorage: ["origin": "[12,34]"])
+        let decoded = try JSONDecoder().decode(WallpaperRenderSnapshot.self, from: JSONEncoder().encode(a))
+        try require(decoded == a, "Runtime snapshot did not round-trip")
+        try require(a.rawProperties["number"] == .number(1) && a.rawProperties["zero"] == .number(0) &&
+                    a.rawProperties["flag"] == .bool(true) && a.rawProperties["word"] == .string("1"),
+                    "Combo primitive types were changed")
+        try require(a.properties(for: wallpaper)["text"]?.value == properties["text"]?.value,
+                    "Unicode preview property was changed")
+        var b = a
+        b.rawProperties["enabled"] = .bool(true)
+        b.position = WallpaperPosition(x: 0.9, y: 0.8)
+        b.speed = 0.5
+        b.scriptStorage = ["origin": "[56,78]"]
+        let manager = ScreenSaverManager(configurationDirectory: root.appending(path: "RuntimeConfiguration"))
+        var context = ScreenSaverManager.ConfigurationContext(positions: ["a": a.position, "b": b.position],
+            selectedPosition: a.position, fps: 45, enableHDRVideo: false, loadFromMemory: false, language: "en")
+        context.sourceDisplayKey = "a"
+        context.runtimeByDisplay = ["a": a, "b": b]
+        try manager.configure(with: wallpaper, runtime: runtime, properties: properties, fps: 45, context: context)
+        try manager.configure(with: wallpaper, runtime: runtime, properties: properties, fps: 45,
+                              forDynamicLockScreen: true, context: context)
+        let savedA = try Data(contentsOf: manager.configurationURL)
+        context.sourceDisplayKey = "b"
+        b.rawProperties["amount"] = .number(0.8)
+        context.runtimeByDisplay = ["b": b]
+        manager.updateRuntimeIfConfigured(wallpaper: wallpaper, runtime: runtime,
+                                           properties: b.properties(for: wallpaper), context: context)
+        for url in [manager.configurationURL, manager.dynamicLockScreenConfigurationURL] {
+            let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+            let perDisplay = object["runtimeByDisplay"] as! [String: [String: Any]]
+            try require((object["speed"] as? NSNumber)?.floatValue == a.speed,
+                        "Editing another display replaced the fallback runtime")
+            try require(perDisplay["a"]?["scriptStorage"] as? [String: String] == a.scriptStorage &&
+                        perDisplay["b"]?["scriptStorage"] as? [String: String] == b.scriptStorage,
+                        "Saver script state crossed display boundaries")
+            let values = perDisplay["b"]?["rawProperties"] as? [String: Any]
+            try require(values?["amount"] as? Double == 0.8, "Saver did not synchronize changed properties")
+        }
+        let current = try Data(contentsOf: manager.configurationURL)
+        manager.updateRuntimeIfConfigured(wallpaper: wallpaper, runtime: runtime,
+                                           properties: b.properties(for: wallpaper), context: context)
+        let duplicate = try Data(contentsOf: manager.configurationURL)
+        try require(current == duplicate && current != savedA, "Saver updates were not stable or did not change")
+        context.capturedAt = 0
+        manager.updateRuntimeIfConfigured(wallpaper: wallpaper, runtime: runtime, properties: [:], context: context)
+        let afterStale = try Data(contentsOf: manager.configurationURL)
+        try require(afterStale == current, "A stale saver update replaced a newer configuration")
+
+        let container = root.appending(path: "RuntimeLockDeployment")
+        let configURL = container.appending(path: "dynamic-lock-screen.json")
+        let displays = [
+            DynamicLockScreenManager.DisplaySnapshot(displayID: 701, fallbackSource: nil,
+                systemFallbackSource: nil, position: a.position, displayKey: "a", runtime: a),
+            DynamicLockScreenManager.DisplaySnapshot(displayID: 702, fallbackSource: nil,
+                systemFallbackSource: nil, position: b.position, displayKey: "b", runtime: b)
+        ]
+        let prepared = try DynamicLockScreenManager.prepareConfiguration(wallpaper, runtime: runtime,
+            properties: properties, fps: 45, displays: displays, loadFromMemory: false, container: container)
+        try DynamicLockScreenManager.commitConfiguration(prepared, configurationURL: configURL)
+        let initialData = try Data(contentsOf: configURL)
+        let initial = try JSONDecoder().decode(DynamicLockScreenConfiguration.self, from: initialData)
+        try require(initial.displays["display-701"]?.speed == a.speed && initial.displays["display-702"]?.speed == b.speed,
+                    "Lock deployment lost per-display speed")
+        let unchanged = try DynamicLockScreenManager.updateRuntime(a, wallpaper: wallpaper,
+            displayKey: "a", displayID: 701, configurationURL: configURL)
+        try require(unchanged == nil, "Identical lock runtime triggered a rewrite")
+        var changed = b
+        changed.rawProperties["text"] = .string("updated")
+        changed.scriptStorage = [:]
+        let updated = try DynamicLockScreenManager.updateRuntime(changed, wallpaper: wallpaper,
+            displayKey: "b", displayID: 702, configurationURL: configURL)
+        try require(updated?.displays["display-702"]?.rawProperties["text"] == .string("updated") &&
+                    updated?.displays["display-702"]?.scriptStorage == [:], "Lock runtime/reset was not synchronized")
+        try require(updated?.displays["display-701"]?.runtimeRevision == initial.displays["display-701"]?.runtimeRevision,
+                    "Editing display B invalidated display A")
+        let stale = try DynamicLockScreenManager.updateRuntime(b, wallpaper: wallpaper,
+            displayKey: "b", displayID: 702, configurationURL: configURL, requestedAt: 0)
+        try require(stale == nil, "Stale lock runtime was accepted")
+        let sourceAfter = try Data(contentsOf: asset)
+        try require(sourceAfter == image, "Deployment changed the original texture")
+        guard case .object(let texture) = updated?.displays["display-702"]?.rawProperties["texture"],
+              case .string(let path) = texture["value"] else {
+            throw RegressionFailure(description: "Deployed texture descriptor is missing")
+        }
+        let deployedImage = try Data(contentsOf: URL(fileURLWithPath: path))
+        try require(path.hasPrefix(prepared.root.path) && deployedImage == image,
+                    "Updated lock texture is outside the deployment or damaged")
+        print("PASS: typed runtime snapshots, per-display saver/lock synchronization, state isolation, speed, deduplication and stale update rejection")
     }
 
     static func testLockScreenDeployment() async throws {

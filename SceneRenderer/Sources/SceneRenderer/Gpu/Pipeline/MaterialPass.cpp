@@ -294,27 +294,26 @@ static std::span<uint8_t> MakeUniformUploadBytes(const sr::ShaderValue&         
 // must be resolved against the block that declares it rather than against
 // block 0. (Only one uniform buffer is bound — see the ubo_buf comment in
 // prepare() — so this is a lookup fix, not multi-UBO support.)
-static const ShaderReflected::BlockedUniform*
-FindBlockedUniform(std::span<const ShaderReflected::Block> blocks, std::string_view name) {
-    for (const auto& block : blocks) {
-        auto uni = block.member_map.find(name);
-        if (uni != block.member_map.end()) return &uni->second;
-    }
-    return nullptr;
+using UniformUploadTable = decltype(ShaderReflected::Block {}.member_map);
+
+static UniformUploadTable BuildUniformUploadTable(std::span<const ShaderReflected::Block> blocks) {
+    UniformUploadTable table;
+    for (const auto& block : blocks)
+        for (const auto& [name, uniform] : block.member_map) table.try_emplace(name, uniform);
+    return table;
 }
 
-static bool UniformExists(std::span<const ShaderReflected::Block> blocks, std::string_view name) {
-    return FindBlockedUniform(blocks, name) != nullptr;
+static bool UniformExists(const UniformUploadTable& table, std::string_view name) {
+    return table.find(name) != table.end();
 }
 
 static void UpdateUniform(StagingBuffer* buf, const StagingBufferRef& bufref,
-                          std::span<const ShaderReflected::Block> blocks, std::string_view name,
+                          const UniformUploadTable& table, std::string_view name,
                           const sr::ShaderValue& value) {
     using namespace sr;
-    const auto* uni = FindBlockedUniform(blocks, name);
-    if (uni == nullptr) {
-        return;
-    }
+    const auto found = table.find(name);
+    if (found == table.end()) return;
+    const auto* uni = &found->second;
 
     const size_t offset    = uni->offset;
     const size_t refl_size = uni->size;
@@ -336,7 +335,7 @@ static void UpdateUniform(StagingBuffer* buf, const StagingBufferRef& bufref,
                   uni->slot_stride,
                   value.size() * sizeof(ShaderValue::value_type));
     }
-    buf->writeToBuf(bufref, value_u8, offset);
+    buf->writeToBuf(bufref, value_u8, offset, true);
 }
 
 // Sanity-check the reflected cbuffer: members in `block.member_map` must not
@@ -485,6 +484,8 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
                 return item.second;
             });
 
+        m_desc.descriptor_images.resize(m_desc.vk_textures.size());
+        m_desc.descriptor_writes.reserve(m_desc.vk_textures.size() + 1);
         m_desc.vk_tex_binding.clear();
         m_desc.vk_tex_binding.reserve(m_desc.vk_textures.size());
 
@@ -697,7 +698,7 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         // Copied (not referenced): update_op outlives `ref`, which points into
         // the shader reflection cache. All blocks are kept so a uniform is
         // resolved against the block that actually declares it.
-        auto  blocks = ref->blocks;
+        auto  blocks = BuildUniformUploadTable(ref->blocks);
         auto* buf    = rr.dyn_buf;
         auto* bufref = &m_desc.ubo_buf;
 
@@ -901,15 +902,16 @@ void CustomShaderPass::recordRenderScopeDraw(RenderingResources& rr) {
     }
     auto& cmd    = rr.command;
     auto& outext = m_desc.vk_output.extent;
+    auto& writes = m_desc.descriptor_writes;
+    writes.clear();
     for (usize i = 0; i < m_desc.vk_textures.size(); i++) {
         auto& slot    = m_desc.vk_textures[i];
         int   binding = m_desc.vk_tex_binding[i];
         if (binding < 0) continue;
         if (slot.slots.empty()) continue;
         auto&                 img = slot.getActive();
-        VkDescriptorImageInfo desc_img { img.sampler,
-                                         img.view,
-                                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        auto&                 desc_img = m_desc.descriptor_images[i];
+        desc_img = { img.sampler, img.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkWriteDescriptorSet  wset {
             .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .pNext           = nullptr,
@@ -919,12 +921,12 @@ void CustomShaderPass::recordRenderScopeDraw(RenderingResources& rr) {
             .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .pImageInfo      = &desc_img,
         };
-        cmd.PushDescriptorSetKHR(
-            VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline->pipeline.layout, 0, wset);
+        writes.push_back(wset);
     }
 
+    VkDescriptorBufferInfo desc_buf {};
     if (m_desc.ubo_buf) {
-        VkDescriptorBufferInfo desc_buf {
+        desc_buf = {
             rr.dyn_buf->gpuBuf(),
             m_desc.ubo_buf.offset,
             m_desc.ubo_buf.size,
@@ -938,10 +940,12 @@ void CustomShaderPass::recordRenderScopeDraw(RenderingResources& rr) {
             .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
             .pBufferInfo     = &desc_buf,
         };
-        cmd.PushDescriptorSetKHR(
-            VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline->pipeline.layout, 0, wset);
+        writes.push_back(wset);
     }
 
+    if (! writes.empty())
+        cmd.PushDescriptorSetKHR(
+            VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline->pipeline.layout, 0, writes);
     cmd.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline->pipeline.handle);
     VkViewport viewport {
         .x        = 0,

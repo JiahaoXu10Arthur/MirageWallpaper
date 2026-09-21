@@ -80,6 +80,93 @@ enum WEPropertyValue: Codable, Equatable, Hashable {
     }
 }
 
+enum WallpaperPropertyEncoding {
+    static func value(_ property: WEProjectProperty) -> Any {
+        switch property.propertyType {
+        case .color:
+            return ["type": "color", "value": property.value.stringValue]
+        case .bool:
+            return property.value.boolValue
+        case .slider:
+            return property.value.doubleValue
+        case .scenetexture, .file:
+            return ["type": "scenetexture", "value": property.value.stringValue]
+        case .combo:
+            return property.value.jsonObjectValue
+        case .usershortcut:
+            var result: [String: Any] = ["type": "usershortcut", "value": property.value.stringValue]
+            if let icon = property.mirageShortcutIcon { result["icon"] = icon }
+            return result
+        default:
+            return property.value.stringValue
+        }
+    }
+
+    static func values(_ properties: [String: WEProjectProperty]) -> [String: Any] {
+        properties.mapValues(value)
+    }
+}
+
+struct WallpaperRenderSnapshot: Codable, Equatable, Sendable {
+    static let configurationSession = UUID().uuidString
+    var rawProperties: [String: AnyCodableValue]
+    var fillMode: String
+    var position: WallpaperPosition
+    var speed: Float
+    var scriptStorage: [String: String]?
+
+    init(runtime: WallpaperRuntimeState, properties: [String: WEProjectProperty],
+         scriptStorage: [String: String]? = nil) {
+        rawProperties = WallpaperPropertyEncoding.values(properties).mapValues(AnyCodableValue.init)
+        fillMode = runtime.fillMode.rawValue
+        position = runtime.position
+        speed = runtime.speed.isFinite && runtime.speed > 0 ? runtime.speed : 1
+        self.scriptStorage = scriptStorage
+    }
+
+    func properties(for wallpaper: WEWallpaper) -> [String: WEProjectProperty] {
+        var result = wallpaper.project.general?.properties?.items ?? [:]
+        for (key, encoded) in rawProperties {
+            guard var property = result[key] else { continue }
+            var value = encoded
+            if case .object(let descriptor) = encoded {
+                value = descriptor["value"] ?? .null
+                if case .string(let icon) = descriptor["icon"] { property.mirageShortcutIcon = icon }
+            }
+            switch value {
+            case .string(let text): property.value = .string(text)
+            case .bool(let flag): property.value = .bool(flag)
+            case .number(let number): property.value = .number(number)
+            default: continue
+            }
+            result[key] = property
+        }
+        return result
+    }
+
+    var dictionary: [String: Any] {
+        var result: [String: Any] = [
+            "rawProperties": rawProperties.mapValues(\.foundationValue),
+            "fillMode": fillMode, "position": position.dictionary, "speed": speed
+        ]
+        if let scriptStorage { result["scriptStorage"] = scriptStorage }
+        return result
+    }
+
+    static func storedScriptStorage(for wallpaper: WEWallpaper) -> [String: String] {
+        guard wallpaper.kind == .scene else { return [:] }
+        let id = wallpaper.resolvedEntryURL.deletingLastPathComponent().lastPathComponent
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: "Library/Application Support/Mirage/SceneStorage")
+            .appending(path: "\(id).json")
+        guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              size <= 8 * 1024 * 1024,
+              let data = try? Data(contentsOf: url),
+              let snapshot = try? JSONDecoder().decode([String: String].self, from: data) else { return [:] }
+        return snapshot
+    }
+}
+
 // MARK: - 属性选项
 
 struct WEProjectPropertyOption: Codable, Equatable, Hashable {

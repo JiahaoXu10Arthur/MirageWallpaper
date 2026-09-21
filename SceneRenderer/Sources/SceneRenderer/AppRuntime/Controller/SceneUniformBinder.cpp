@@ -102,6 +102,13 @@ void SceneUniformUpdater::FrameBegin() {
 
 void SceneUniformUpdater::FrameEnd() {}
 
+bool SceneUniformUpdater::RequiresContinuousFrames() const {
+    if (m_dynamic_uniforms || m_parallax.enable || m_cameraShake.enable) return true;
+    for (const auto& [node, data] : m_nodeDataMap)
+        if (data.puppet_layer) return true;
+    return false;
+}
+
 void SceneUniformUpdater::MouseInput(double x, double y) {
     using namespace std::chrono;
 
@@ -175,6 +182,11 @@ void SceneUniformUpdater::InitUniforms(SceneNode* pNode, const ExistsUniformOp& 
         value.has_mipmap     = existsOp(WE_GLTEX_MIPMAPINFO_NAMES[index]);
         return index + 1;
     });
+    m_dynamic_uniforms |=
+        info.has_TIME || info.has_FRAMETIME || info.has_DAYTIME || info.has_DAYTIME_LEGACY ||
+        info.has_POINTERPOSITION || info.has_POINTERPOSITIONLAST || info.has_PARALLAXPOSITION ||
+        info.has_BONES || info.has_BONESALPHA || info.has_audio_16_l || info.has_audio_16_r ||
+        info.has_audio_32_l || info.has_audio_32_r || info.has_audio_64_l || info.has_audio_64_r;
 }
 
 std::optional<SceneNodeRenderTransform>

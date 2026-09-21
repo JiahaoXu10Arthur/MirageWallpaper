@@ -216,6 +216,10 @@ public:
     // subsequent script writes flush back to the file. Pass an empty
     // string to revert to in-memory-only behaviour.
     void SetPersistence(std::string path);
+    void SetStorageSnapshot(std::string_view snapshot);
+    std::string StorageSnapshot() const;
+    void SetStorageCallback(std::function<void(std::string)> callback);
+    void PublishStorageSnapshot();
 
     void ResetLocalStorage();
 
@@ -402,6 +406,8 @@ void SetSceneMediaStatus(sr::Scene& scene, const MediaStatus& status);
 void SetSceneUserShortcutOpener(sr::Scene& scene, UserShortcutOpener opener);
 
 void ResetSceneLocalStorage(sr::Scene& scene);
+std::string SceneStorageSnapshot(sr::Scene& scene);
+void SetSceneStorageCallback(sr::Scene& scene, std::function<void(std::string)> callback);
 
 // Forward `SetPersistence` to the ScriptScene attached to `scene`. No-op
 // when the scene has no script runtime.

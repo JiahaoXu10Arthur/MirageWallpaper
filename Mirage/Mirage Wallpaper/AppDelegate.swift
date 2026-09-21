@@ -70,7 +70,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     let modeB = ScreenSaverDynamicLockScreenManager.shared.isEnabled
                         && ScreenSaverDynamicLockScreenManager.shared.isConfigured
                     guard modeA || modeB else { return }
-                    self.wallpaperViewModel.suspendForExternalLockScreen()
+                    guard await self.wallpaperViewModel.prepareForExternalLockScreen() else { return }
                     if modeB && !ScreenSaverDynamicLockScreenManager.shared.enterLockedState() {
                         self.wallpaperViewModel.resumeAfterExternalLockScreen()
                         return
