@@ -18,6 +18,7 @@ def main():
                         default=Path(tempfile.gettempdir()) / "MirageUIRegressionBuild")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--startup-playlist", action="store_true")
+    parser.add_argument("--wallpaper-runtime", action="store_true")
     parser.add_argument("--playback-policy", action="store_true")
     parser.add_argument("--workshop-pagination", action="store_true")
     parser.add_argument("--configuration", choices=["Debug", "Release"], default="Debug")
@@ -74,6 +75,8 @@ def main():
         command = [str(executable)]
         if args.startup_playlist:
             command.append("--startup-playlist")
+        if args.wallpaper_runtime:
+            command.append("--wallpaper-runtime")
         if args.playback_policy:
             command.append("--playback-policy")
         if args.workshop_pagination:
