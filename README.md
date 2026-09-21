@@ -209,6 +209,11 @@ MIRAGE_STEAM_WEB_API_KEY='YOUR_32_CHARACTER_STEAM_WEB_API_KEY' \
 ```text
 MIRAGE_STEAM_WEB_API_KEY      32 位 Steam Web API Key
 MIRAGE_SPARKLE_PRIVATE_KEY    Mirage 专用 Sparkle Ed25519 私钥
+APPLE_DEVELOPER_ID_APPLICATION_P12             Base64 编码的 Developer ID Application P12 证书
+APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD    P12 证书密码
+APPLE_NOTARY_APPLE_ID                          Apple ID
+APPLE_NOTARY_PASSWORD                          Apple ID 专用密码
+APPLE_DEVELOPER_TEAM_ID                        Apple Developer Team ID
 ```
 
 如果本机安装了 GitHub CLI，也可以执行：
@@ -230,7 +235,7 @@ App 更新后的下一次启动会同时检查已经安装到 `~/Library/Screen 
 
 GitHub Secrets 可以避免 Key 出现在仓库和普通构建日志中，但无法让客户端内置 Key 成为真正的秘密：发布后的 App 必须包含它，有能力分析 App 的人仍可以提取。若未来需要不可提取的凭据，应把对应请求放到受控服务端，由服务端持有 Key；不要依赖客户端混淆。
 
-当前 Workflow 使用临时签名，不包含 Apple Developer ID 签名和公证。首次安装的用户仍可能需要在 macOS Gatekeeper 中手动允许 Mirage；但后续更新的真实性由内置 Ed25519 公钥验证。
+Workflow 会在临时钥匙串中导入 Developer ID Application 证书，以 Hardened Runtime 和安全时间戳签名完整 App，提交 Apple 公证、装订公证凭证，并在打包前通过签名、公证凭证和 Gatekeeper 校验。Sparkle Ed25519 签名继续独立保护后续更新的真实性。
 
 ## 数据目录
 

@@ -298,6 +298,10 @@ done
 for bin in "$RENDERERS/SceneWallpaper" "$RENDERERS/WebWallpaper" "$RENDERERS/VideoWallpaper"; do
     sign_item "$bin"
 done
+NOW_PLAYING="$RESOURCES/NowPlaying/libMirageNowPlaying.dylib"
+if [ -f "$NOW_PLAYING" ]; then
+    sign_item "$NOW_PLAYING"
+fi
 [ -d "$EXTENSION" ] || { echo "[bundle] shared runtime requires the wallpaper extension" >&2; exit 1; }
 SHARED_FRAMEWORKS="$EXTENSION/Contents/Frameworks"
 SHARED_RESOURCES="$EXTENSION/Contents/Resources"

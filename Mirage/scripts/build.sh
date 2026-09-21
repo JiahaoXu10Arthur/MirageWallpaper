@@ -17,6 +17,7 @@ TEMP_XCCONFIG=""
 SIGN_IDENTITY="${MIRAGE_SIGN_IDENTITY:--}"
 DEVELOPMENT_TEAM="${MIRAGE_DEVELOPMENT_TEAM:-}"
 NOTARY_PROFILE="${MIRAGE_NOTARY_PROFILE:-}"
+NOTARY_KEYCHAIN="${MIRAGE_NOTARY_KEYCHAIN:-}"
 NOTARY_TEMP_DIR=""
 
 case "$TARGET_ARCH" in
@@ -45,8 +46,6 @@ printf 'MIRAGE_GIT_COMMIT = %s\n' "$GIT_COMMIT" >> "$TEMP_XCCONFIG"
 printf 'MIRAGE_UPDATE_ARCH = %s\n' "$TARGET_ARCH" >> "$TEMP_XCCONFIG"
 if [ "$SIGN_IDENTITY" != "-" ]; then
     [ -n "$DEVELOPMENT_TEAM" ] || { echo "[build] 正式签名需要 MIRAGE_DEVELOPMENT_TEAM" >&2; exit 1; }
-    printf 'DEVELOPMENT_TEAM = %s\n' "$DEVELOPMENT_TEAM" >> "$TEMP_XCCONFIG"
-    printf 'CODE_SIGN_IDENTITY = %s\n' "$SIGN_IDENTITY" >> "$TEMP_XCCONFIG"
     printf 'ENABLE_HARDENED_RUNTIME = YES\n' >> "$TEMP_XCCONFIG"
 fi
 XCCONFIG_ARGS=(-xcconfig "$TEMP_XCCONFIG")
@@ -69,11 +68,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-CODE_SIGNING_REQUIRED=NO
-if [ "$SIGN_IDENTITY" != "-" ]; then
-    CODE_SIGNING_REQUIRED=YES
-fi
-
 APP="$BUILD_DIR/DD/Build/Products/$CONFIG/Mirage Wallpaper.app"
 
 if [ -d "$APP/Contents/Resources/Renderers" ]; then
@@ -95,7 +89,7 @@ if ! xcodebuild "${XCCONFIG_ARGS[@]}" -project "$PROJECT" -scheme "$SCHEME" -con
     -destination 'platform=macOS' \
     -derivedDataPath "$BUILD_DIR/DD" \
     ARCHS="$TARGET_ARCH" ONLY_ACTIVE_ARCH=YES \
-    CODE_SIGN_IDENTITY="$SIGN_IDENTITY" CODE_SIGNING_REQUIRED="$CODE_SIGNING_REQUIRED" CODE_SIGNING_ALLOWED=YES \
+    CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES \
     "${RELEASE_FLAGS[@]}" \
     build > "$BUILD_LOG" 2>&1; then
     echo "[build] 编译失败，错误摘要:" >&2
@@ -122,7 +116,26 @@ bash "$HERE/report_bundle_size.sh" "$OUT/Mirage.app"
 if [ "$SIGN_IDENTITY" != "-" ] && [ -n "$NOTARY_PROFILE" ]; then
     NOTARY_TEMP_DIR="$(mktemp -d -t mirage-notary)"
     ditto -c -k --keepParent "$OUT/Mirage.app" "$NOTARY_TEMP_DIR/Mirage.zip"
-    xcrun notarytool submit "$NOTARY_TEMP_DIR/Mirage.zip" --keychain-profile "$NOTARY_PROFILE" --wait
+    NOTARY_AUTH_ARGS=(--keychain-profile "$NOTARY_PROFILE")
+    if [ -n "$NOTARY_KEYCHAIN" ]; then
+        NOTARY_AUTH_ARGS+=(--keychain "$NOTARY_KEYCHAIN")
+    fi
+    NOTARY_RESULT="$NOTARY_TEMP_DIR/result.json"
+    if ! xcrun notarytool submit "$NOTARY_TEMP_DIR/Mirage.zip" "${NOTARY_AUTH_ARGS[@]}" --wait --output-format json > "$NOTARY_RESULT"; then
+        cat "$NOTARY_RESULT" >&2
+        SUBMISSION_ID="$(plutil -extract id raw -o - "$NOTARY_RESULT" 2>/dev/null || true)"
+        if [ -n "$SUBMISSION_ID" ]; then
+            xcrun notarytool log "$SUBMISSION_ID" "${NOTARY_AUTH_ARGS[@]}" >&2 || true
+        fi
+        exit 1
+    fi
+    cat "$NOTARY_RESULT"
+    NOTARY_STATUS="$(plutil -extract status raw -o - "$NOTARY_RESULT")"
+    if [ "$NOTARY_STATUS" != "Accepted" ]; then
+        SUBMISSION_ID="$(plutil -extract id raw -o - "$NOTARY_RESULT")"
+        xcrun notarytool log "$SUBMISSION_ID" "${NOTARY_AUTH_ARGS[@]}" >&2 || true
+        exit 1
+    fi
     xcrun stapler staple "$OUT/Mirage.app"
     xcrun stapler validate "$OUT/Mirage.app"
 fi

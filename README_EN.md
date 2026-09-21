@@ -214,6 +214,11 @@ Before the first run, add these Repository Secrets in **Settings → Secrets and
 ```text
 MIRAGE_STEAM_WEB_API_KEY      32-character Steam Web API key
 MIRAGE_SPARKLE_PRIVATE_KEY    Mirage's Sparkle Ed25519 private key
+APPLE_DEVELOPER_ID_APPLICATION_P12             Base64-encoded Developer ID Application P12 certificate
+APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD    P12 certificate password
+APPLE_NOTARY_APPLE_ID                          Apple ID
+APPLE_NOTARY_PASSWORD                          Apple ID app-specific password
+APPLE_DEVELOPER_TEAM_ID                        Apple Developer Team ID
 ```
 
 If GitHub CLI is installed locally, you can run:
@@ -235,7 +240,7 @@ On the next launch after updating, Mirage also checks any installed `MirageScree
 
 GitHub Secrets prevent a key from appearing in the repository and ordinary build logs, but they cannot make a key embedded in a distributed client truly secret. Anyone capable of inspecting the App can extract it. If a non-extractable credential is required later, move the request to a controlled server that holds the key; do not rely on client-side obfuscation.
 
-The current workflow uses temporary signing and does not include Apple Developer ID signing or notarization. First-time users may need to manually allow Mirage in macOS Gatekeeper, while subsequent update authenticity is verified with the built-in Ed25519 public key.
+The workflow imports the Developer ID Application certificate into a temporary keychain, signs the complete App with Hardened Runtime and a secure timestamp, submits it to Apple for notarization, staples the ticket, and verifies its signature, ticket, and Gatekeeper acceptance before packaging. Sparkle Ed25519 signing continues to protect the authenticity of subsequent updates independently.
 
 ## Data Directories
 
