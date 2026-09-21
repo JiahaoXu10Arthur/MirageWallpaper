@@ -4796,7 +4796,18 @@ void RunFieldScriptInit(JSContext* ctx, JsRuntime::Impl* rt, FieldScript* fs) {
     JSValue arg                  = JS_DupValue(ctx, I->current_value);
     JSValue r                    = JS_Call(ctx, I->init_fn, JS_UNDEFINED, 1, &arg);
     JS_FreeValue(ctx, arg);
-    if (JS_IsException(r)) rt->LogError(ctx, I->sha, "init threw");
+    if (JS_IsException(r)) {
+        rt->LogError(ctx, I->sha, "init threw");
+    } else {
+        NoteBoolReturnMismatch(I->kind, I->bool_return_warned, I->sha, r, "init");
+        ScriptValue initial = CoerceReturn(ctx, r, I->kind);
+        if (! std::holds_alternative<std::monostate>(initial)) {
+            JSValue next = ScriptValueToJs(ctx, initial);
+            JS_FreeValue(ctx, I->current_value);
+            I->current_value = next;
+            I->last_value    = std::move(initial);
+        }
+    }
     JS_FreeValue(ctx, r);
     rt->host.active_field_script = nullptr;
     I->init_done                 = true;
