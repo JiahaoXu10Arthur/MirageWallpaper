@@ -707,6 +707,7 @@ struct FieldScript::Impl {
     ScriptValue last_value;
     bool        alive { true };
     bool        error_logged { false };
+    bool        bool_return_warned { false };
     // Layer-B: the SceneNode this script's `thisLayer` resolves to. Null →
     // fall back to the generic JS stub. `wrapped_layer` caches the JSValue
     // wrapper so per-frame swap doesn't reallocate.
@@ -757,6 +758,21 @@ void FieldScript::AddAssetCloneQueue(std::string asset, std::vector<sr::SceneNod
         m_impl->clone_asset_keys[node] = asset;
         queue.push_back(node);
     }
+}
+
+namespace
+{
+
+void NoteBoolReturnMismatch(FieldKind kind, bool& warned, std::string_view sha, JSValueConst ret,
+                            const char* fn) {
+    if (kind != FieldKind::Bool || warned) return;
+    if (JS_IsUndefined(ret) || JS_IsNull(ret) || JS_IsBool(ret)) return;
+    warned = true;
+    rstd_warn("script[{}] {} returned a non-boolean for a bool property; the value was ignored",
+              sha,
+              std::string_view(fn));
+}
+
 }
 
 // ---------------------------------------------------------------------------
@@ -4664,6 +4680,7 @@ void JsRuntime::TickAll() {
             JS_FreeValue(ctx, ret);
             continue;
         }
+        NoteBoolReturnMismatch(I->kind, I->bool_return_warned, I->sha, ret, "update");
         I->last_value = CoerceReturn(ctx, ret, I->kind);
         // Keep the next argument in the field's coerced shape. Vec3 scripts
         // often return a scalar for scale, but still read value.x next frame.
