@@ -26,8 +26,7 @@ namespace
 {
 
 FieldKind GuessFieldKind(std::string_view field) {
-    // Visible/enabled-style fields: bool. Several scripts return numbers
-    // 0/1 here too; coercion table accepts both.
+    // Visible/enabled-style fields: bool.
     if (field == "visible") return FieldKind::Bool;
     // Vec3 (position-like) fields.
     if (field == "origin" || field == "scale" || field == "angles" || field == "spriteoffset")
@@ -140,8 +139,8 @@ ScriptValue CoerceReturn(JSContext* ctx, JSValue ret, FieldKind kind) {
 
     switch (kind) {
     case FieldKind::Bool: {
-        int b = JS_ToBool(ctx, ret);
-        return BoolValue { b > 0 };
+        if (! JS_IsBool(ret)) return {};
+        return BoolValue { JS_ToBool(ctx, ret) > 0 };
     }
     case FieldKind::Scalar: {
         if (JS_IsBool(ret)) {
