@@ -3407,8 +3407,16 @@ void ParseImageObj(ParseContext& context, wpscene::ImageObject& img_obj,
 
         shaderInfo.baseConstSvs = baseConstSvs;
 
+        auto source_wpmat = image_wpmat.clone();
+        if (hasEffect && has_bones &&
+            (source_wpmat.shader == "genericimage2" || source_wpmat.shader == "genericimage3" ||
+             source_wpmat.shader == "genericimage4")) {
+            source_wpmat.combos[std::string(WE_CB_LIGHTING)] = 0;
+            source_wpmat.combos[std::string(WE_CB_REFLECTION)] = 0;
+        }
+
         if (! LoadMaterial(vfs,
-                           image_wpmat,
+                           source_wpmat,
                            context.scene.get(),
                            spImgNode.as_ptr(),
                            &material,

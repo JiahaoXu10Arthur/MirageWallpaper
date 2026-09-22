@@ -705,6 +705,8 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
         auto* node           = m_desc.node;
         auto  render_view    = m_desc.render_view;
         auto  alpha_mode     = m_desc.alpha_mode;
+        const bool clamp_coverage = material_ref.blenmode == BlendMode::Translucent ||
+                                    material_ref.blenmode == BlendMode::AlphaToCoverage;
         auto* shader_updater = scene.shaderValueUpdater.get();
         auto& sprites        = m_desc.sprites_map;
         auto& vk_textures    = m_desc.vk_textures;
@@ -716,6 +718,7 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
                             node,
                             render_view,
                             alpha_mode,
+                            clamp_coverage,
                             &sprites,
                             &vk_textures,
                             update_dyn_buf_op,
@@ -734,6 +737,8 @@ void CustomShaderPass::prepare(Scene& scene, const Device& device, RenderingReso
                 UpdateUniform(buf, *bufref, blocks, name, value);
             };
             shader_updater->UpdateUniforms(node, sprites, update_unf_op, render_view, alpha_mode);
+            UpdateUniform(buf, *bufref, blocks, "g_MirageClampCoverage",
+                          ShaderValue(clamp_coverage ? 1.0f : 0.0f));
             // update image slot for sprites
             {
                 for (auto& [i, sp] : sprites) {

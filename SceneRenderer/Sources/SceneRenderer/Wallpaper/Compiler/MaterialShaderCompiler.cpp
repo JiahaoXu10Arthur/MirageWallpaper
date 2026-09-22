@@ -1549,6 +1549,7 @@ inline SynthOutput SynthesizeHLSLEntry(ShaderType stage, std::vector<IODecl> att
             out += "    " + v.name + " = _ww_in." + v.name + ";\n";
         }
         out += "    shader_main();\n";
+        out += "    if (g_MirageClampCoverage > 0.5) glOutColor.a = saturate(glOutColor.a);\n";
         out += "    return glOutColor;\n";
         out += "}\n";
     }
@@ -1651,6 +1652,7 @@ Map<std::string, std::string> BuildUniformUnion(std::span<const WPShaderUnit> un
             MergeUniform(uniforms, name, ty);
         }
     }
+    uniforms["g_MirageClampCoverage"] = "float";
     return uniforms;
 }
 
@@ -1896,7 +1898,7 @@ Finalprocessor(const WPShaderUnit& unit, const WPPreprocessorInfo* pre,
 
 inline std::string GenSha1(std::span<const WPShaderUnit> units) {
     static constexpr std::string_view kShaderCacheSalt {
-        "SceneRenderer-HLSL-MoltenVK-rect-matrix-v4"
+        "SceneRenderer-HLSL-MoltenVK-coverage-v5"
     };
     std::string shas(kShaderCacheSalt);
     for (auto& unit : units) {
